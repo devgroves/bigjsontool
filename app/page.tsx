@@ -4,7 +4,7 @@ import { useCallback, useRef, useState } from "react";
 import JsonEditor from "./components/JsonEditor";
 import Spinner from "./components/Spinner";
 
-type Status = "idle" | "uploading" | "streaming" | "done" | "error";
+type Status = "idle" | "uploading" | "streaming" | "downloading" | "done" | "error";
 
 function formatBytes(n: number) {
   if (n < 1024) return `${n} B`;
@@ -21,6 +21,7 @@ export default function Home() {
   const [chunkSize, setChunkSize] = useState(500);
   const [delayMs, setDelayMs] = useState(20);
   const [importedName, setImportedName] = useState<string | null>(null);
+  const [importUrl, setImportUrl] = useState("");
   // The server-side id of whatever's currently loaded. This is the only
   // thing the editor/tree view need — they fetch content by line-window
   // and by-level respectively, rather than the browser ever holding the
@@ -160,8 +161,51 @@ export default function Home() {
     []
   );
 
+  const handleImportUrl = useCallback(async () => {
+    const url = importUrl.trim();
+    if (!url) return;
+
+    setBytes(0);
+    setElapsedMs(0);
+    setError(null);
+    setImportedName(url.split("/").pop() || "remote.json");
+    setFileId(null);
+    setStatus("downloading");
+
+    const controller = new AbortController();
+    abortRef.current = controller;
+
+    try {
+      const startTime = performance.now();
+      const res = await fetch("/api/import-url", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ url }),
+        signal: controller.signal,
+      });
+
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body?.error || `Import failed with ${res.status}`);
+      }
+
+      const body = await res.json();
+      setBytes(body.size);
+      setElapsedMs(performance.now() - startTime);
+      setFileId(body.id);
+      setStatus("done");
+    } catch (e: any) {
+      if (e.name === "AbortError") {
+        setStatus("idle");
+      } else {
+        setStatus("error");
+        setError(e.message || "Something went wrong while importing the URL.");
+      }
+    }
+  }, [importUrl]);
+
   const speed = elapsedMs > 0 ? bytes / (elapsedMs / 1000) : 0;
-  const busy = status === "streaming" || status === "uploading";
+  const busy = status === "streaming" || status === "uploading" || status === "downloading";
 
   return (
     <main className="wrap">
@@ -239,6 +283,24 @@ export default function Home() {
         >
           Import from disk…
         </button>
+
+        <div className="url-import-group">
+          <input
+            type="text"
+            className="url-input"
+            placeholder="https://example.com/data.json"
+            value={importUrl}
+            disabled={busy}
+            onChange={(e: { target: { value: any; }; }) => setImportUrl(e.target.value)}
+          />
+          <button
+            className="btn url-import"
+            disabled={busy || !importUrl.trim()}
+            onClick={handleImportUrl}
+          >
+            Import from URL
+          </button>
+        </div>
       </section>
 
       <section className="stats">
@@ -271,7 +333,7 @@ export default function Home() {
       </section>
 
         <JsonEditor
-          value={fileId ? "" : "// Press \"Start streaming\" or \"Import from disk\" to load JSON"}
+          value={fileId ? "" : "// Press \"Start streaming\", \"Import from disk\", or \"Import from URL\" to load JSON"}
           fileId={fileId}
         />
 
