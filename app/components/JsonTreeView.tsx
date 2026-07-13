@@ -315,6 +315,33 @@ function flatten(
   });
 }
 
+/** Appends items to an array at `jsonPath`, replacing `newItems.length` items
+ *  starting at `offset`.  Used for pagination — clicking the "N items remaining"
+ *  placeholder fetches the next batch and splices it into the array. */
+function extendArrayAtPath(root: JsonValue, jsonPath: string, newItems: JsonValue[], offset: number): JsonValue {
+  const segments = jsonPath.replace(/^\$\.?/, "").split(".").filter(Boolean);
+  function recur(node: JsonValue, idx: number): JsonValue {
+    if (idx === segments.length) {
+      const arr = Array.isArray(node) ? node : [];
+      return [...arr.slice(0, offset), ...newItems, ...arr.slice(offset + newItems.length)] as JsonValue;
+    }
+    const seg = segments[idx];
+    if (Array.isArray(node)) {
+      const i = Number(seg);
+      const copy = node.slice();
+      copy[i] = recur(copy[i], idx + 1);
+      return copy;
+    }
+    if (isObject(node)) {
+      const copy = { ...node };
+      copy[seg] = recur(copy[seg], idx + 1);
+      return copy;
+    }
+    return node;
+  }
+  return recur(root, 0);
+}
+
 /** Immutably replaces the value at `jsonPath` inside `root` — used to splice
  *  a freshly-fetched subtree back into the tree after expanding a
  *  server-truncated node. */
@@ -604,12 +631,24 @@ export default function JsonTreeView({
     // changes. Per-node expansion beyond that is handled by loadPlaceholder.
   }, [fileId, collapsed]);
 
+  // Matches MAX_PREVIEW_SIZE on the server — offsets below this are
+  // individual item placeholders, offsets at or above are batch markers.
+  const INDIVIDUAL_ITEM_THRESHOLD = 10;
+
   const loadPlaceholder = useCallback(
-    (jsonPath: string, _parentJsonPath: string, _offset: number) => {
+    (jsonPath: string, parentJsonPath: string, offset: number) => {
       if (!fileId) return;
       setLoadingPaths((prev) => new Set(prev).add(jsonPath));
       const phDepth = Math.min(presetToServerDepth(collapsed), 3);
-      const url = `/api/json-level?id=${encodeURIComponent(fileId)}&path=${encodeURIComponent(jsonPath)}&depth=${phDepth}`;
+
+      // Offsets below the threshold are individual items — fetch the specific
+      // path and replace in place.  Offsets at or above the threshold are batch
+      // markers — fetch from the parent with offset and splice in the results.
+      const isBatch = offset >= INDIVIDUAL_ITEM_THRESHOLD && offset > 0;
+      const url = isBatch
+        ? `/api/json-level?id=${encodeURIComponent(fileId)}&path=${encodeURIComponent(parentJsonPath)}&depth=${phDepth}&offset=${offset}`
+        : `/api/json-level?id=${encodeURIComponent(fileId)}&path=${encodeURIComponent(jsonPath)}&depth=${phDepth}`;
+
       fetch(url)
         .then(async (res) => {
           const body = await res.json();
@@ -617,6 +656,9 @@ export default function JsonTreeView({
           if (body.value == null) throw new Error("Server returned null value");
           setServerRoot((prev) => {
             if (prev == null) return prev;
+            if (isBatch && Array.isArray(body.value)) {
+              return extendArrayAtPath(prev, parentJsonPath, body.value as JsonValue[], offset);
+            }
             return setAtJsonPath(prev, jsonPath, body.value);
           });
         })
