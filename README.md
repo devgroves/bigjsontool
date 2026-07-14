@@ -66,3 +66,23 @@ in-flight request at any time.
   `select list_slice((content->'$.api_responses')::JSON[], 50, 70) from read_text('data_1gb_minified.json');`
 
   right now we will show the root keys of json and fix depth level as 0, when we switch to depth level 1, 2, 3 means it need to prepare json query dynamically for each root json key recursively and then build the tree.. two layer need to be created, one simple native duck db query where we give the queries to get keys, data types, json data and another layer where give level =1 children means it need to take the root json keys one by one query for next children and prepare and then return it. 
+
+  json level route api, 
+    json-level?id=<fileid>&path=$&depth=1
+
+  expected response
+      // it gives json level of content, at root path and its immediate children
+      // if depth =2 it will show second level of children  while returning childrens it should show 10 children expand 
+
+  how to do it
+      and remaining as clickable to expand. 
+        to construct it need to pass the filename to duckdbapi, get the keys requested depth level
+        then query each key data type
+        then each key fetch the value, only if array it need to fetch 10 childrens.
+  for that what is required in duckdb api layer :
+        to do this we need the duckdb query api for all this. 
+  
+
+
+    // it gives json level of content, at root path and its immediate children
+    // if depth =2 it will show second level of children 

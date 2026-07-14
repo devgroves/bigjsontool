@@ -1,8 +1,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createReadStream, readFileSync, existsSync, writeFileSync } from "node:fs";
+import { Readable } from "node:stream";
 import { parserStream } from "stream-json";
 import { dataPath, isValidId, indexFilePath } from "../../lib/uploadStore";
 import { buildIndex } from "../../lib/buildIndex";
+import { getRemoteEntry } from "../../lib/remoteFileStore";
 
 export const dynamic = "force-dynamic";
 
@@ -10,18 +12,8 @@ function truncatedMarker(kind: "object" | "array", count: number) {
   return { __truncated__: true, __kind__: kind, __count__: count };
 }
 
-// Arrays that grow past this size are collapsed into a truncated marker
-// mid-flight (the frame flips from "build" to "skip" and discards further
-// items). This prevents OOM when depth=2 materialises an array with
-// hundreds of thousands of entries (e.g. a 1 GB file with 500 K+ records).
-// When exceeded, the first MAX_PREVIEW_SIZE items are kept and a
-// TruncatedMarker is appended so the user sees real data immediately.
 const MAX_PREVIEW_SIZE = 10;
 
-// With packValues+streamValues the parser emits only complete tokens
-// (keyValue, stringValue, numberValue, start/endObject, start/endArray,
-// trueValue, falseValue, nullValue) — no intermediate startKey/stringChunk
-// etc. This cuts the event count by ~70% and avoids extra dispatch overhead.
 const TOKEN_KINDS = new Set([
   "startObject", "endObject", "startArray", "endArray",
   "keyValue", "stringValue", "numberValue", "nullValue", "trueValue", "falseValue",
@@ -37,41 +29,25 @@ function scalarFromEvent(e: Token): any {
   return e.value;
 }
 
-// ---------------------------------------------------------------------------
-// Stack-based state machine — replaces the previous generator approach.
-//
-// Instead of a generator that yields for every token (high context-switch
-// overhead), we maintain a single stack of frames. Each token arrives in the
-// "data" event handler and is dispatched immediately to the top frame.
-// Frames know their mode ("build", "skip", or "nav") and handle tokens
-// directly without pausing/resuming generators.
-//
-// In "build" mode the frame accumulates the depth-limited result tree.
-// In "skip" mode it counts children (depth exceeded) and discards contents.
-// In "nav" mode it walks the JSON tree looking for a specific key/index path.
-// ---------------------------------------------------------------------------
-
 type FrameMode = "build" | "skip" | "nav";
 
 interface Frame {
   mode: FrameMode;
   isArray: boolean;
-  depth: number;          // remaining depth (build) or -1 (skip/nav)
-  result: any;            // accumulated object/array (build mode)
-  count: number;          // child count (skip mode)
-  key: string | null;     // current key for object frame
-  target: string | null;  // key/index we are looking for (nav mode)
-  navRest: string[];      // remaining path segments after target (nav mode)
-  navIndex: number;       // current array index (nav mode)
-  arrayOffset: number;    // items to skip before building (pagination)
+  depth: number;
+  result: any;
+  count: number;
+  key: string | null;
+  target: string | null;
+  navRest: string[];
+  navIndex: number;
+  arrayOffset: number;
 }
 
-function extractFromFile(
-  filePath: string,
+function parseJsonStream(
+  readable: NodeJS.ReadableStream,
   jsonPath: string,
   depth: number,
-  startOffset?: number,
-  endOffset?: number,
   knownCount?: number,
   arrayOffset?: number,
 ): Promise<any> {
@@ -87,23 +63,16 @@ function extractFromFile(
       resolved = true;
       resolve(value);
       tokenStream.destroy();
-      fileStream.destroy();
+      (readable as any).destroy?.();
     }
 
     function pushFrame(mode: FrameMode, isArray: boolean, frameDepth: number,
                        target: string | null, navRest: string[],
-                       arrayOffset = 0) {
+                       ao = 0) {
       stack.push({
-        mode,
-        isArray,
-        depth: frameDepth,
+        mode, isArray, depth: frameDepth,
         result: mode === "build" ? (isArray ? [] : {}) : null,
-        count: 0,
-        key: null,
-        target,
-        navRest,
-        navIndex: -1,
-        arrayOffset,
+        count: 0, key: null, target, navRest, navIndex: -1, arrayOffset: ao,
       });
     }
 
@@ -128,17 +97,14 @@ function extractFromFile(
     function processToken(event: Token) {
       if (resolved || !TOKEN_KINDS.has(event.name)) return;
 
-      // --- stack empty — root token ---
       if (stack.length === 0) {
         if (segments.length > 0) {
-          // Navigation mode — need to find the path
           if (event.name === "startObject" || event.name === "startArray") {
             pushFrame("nav", event.name === "startArray", -1, segments[0], segments.slice(1));
           } else {
-            finish(undefined); // root is scalar, path won't match
+            finish(undefined);
           }
         } else {
-          // Building from root — pass arrayOffset for pagination
           if (event.name === "startObject" || event.name === "startArray") {
             const ao = event.name === "startArray" ? (arrayOffset ?? 0) : 0;
             pushFrame("build", event.name === "startArray", depth, null, [], ao);
@@ -157,7 +123,6 @@ function extractFromFile(
       }
     }
 
-    // -------- NAVIGATION --------
     function processNav(event: Token, frame: Frame) {
       if (frame.isArray) {
         switch (event.name) {
@@ -181,20 +146,18 @@ function extractFromFile(
             return;
           }
           default: {
-            // scalar array element
             frame.navIndex++;
             if (String(frame.navIndex) === frame.target) {
               if (frame.navRest.length === 0) {
                 finish(scalarFromEvent(event));
               } else {
-                finish(undefined); // scalar can't have children
+                finish(undefined);
               }
             }
             return;
           }
         }
       } else {
-        // Navigating inside an object — keys come via keyValue
         switch (event.name) {
           case "endObject":
             finish(undefined);
@@ -219,7 +182,6 @@ function extractFromFile(
             return;
           }
           default: {
-            // scalar value for an object key
             if (frame.key === frame.target) {
               if (frame.navRest.length === 0) {
                 finish(scalarFromEvent(event));
@@ -233,7 +195,6 @@ function extractFromFile(
       }
     }
 
-    // -------- BUILD / SKIP --------
     function processBuildOrSkip(event: Token, frame: Frame) {
       switch (event.name) {
         case "keyValue": {
@@ -243,8 +204,6 @@ function extractFromFile(
         case "startObject":
         case "startArray": {
           const isArr = event.name === "startArray";
-          // When the parent array has an arrayOffset > 0 we skip
-          // building that item's children entirely.
           if (frame.mode === "skip" || frame.depth - 1 <= 0 || frame.arrayOffset > 0) {
             pushFrame("skip", isArr, -1, null, []);
           } else {
@@ -262,7 +221,6 @@ function extractFromFile(
           const parent = stack[stack.length - 1];
           if (parent.mode === "build") {
             if (parent.isArray) {
-              // Pagination: skip items without adding to result
               if (parent.arrayOffset > 0) {
                 parent.arrayOffset--;
                 return;
@@ -287,11 +245,9 @@ function extractFromFile(
           return;
         }
         default: {
-          // scalar
           const val = scalarFromEvent(event);
           if (frame.mode === "build") {
             if (frame.isArray) {
-              // Pagination: skip items without adding to result
               if (frame.arrayOffset > 0) {
                 frame.arrayOffset--;
                 return;
@@ -322,11 +278,8 @@ function extractFromFile(
       pushFrame("skip", first.name === "startArray", -1, null, []);
     }
 
-    const fileStream = startOffset != null
-      ? createReadStream(filePath, { start: startOffset, end: endOffset })
-      : createReadStream(filePath);
     const tokenStream = parserStream({ packValues: true, streamValues: false });
-    fileStream.pipe(tokenStream);
+    (readable as any).pipe(tokenStream);
 
     tokenStream.on("data", processToken);
     tokenStream.on("end", () => finish(undefined));
@@ -336,7 +289,7 @@ function extractFromFile(
         reject(err);
       }
     });
-    fileStream.on("error", (err: Error) => {
+    (readable as any).on("error", (err: Error) => {
       if (!resolved) {
         resolved = true;
         reject(err);
@@ -345,13 +298,38 @@ function extractFromFile(
   });
 }
 
+function extractFromFile(
+  filePath: string,
+  jsonPath: string,
+  depth: number,
+  startOffset?: number,
+  endOffset?: number,
+  knownCount?: number,
+  arrayOffset?: number,
+): Promise<any> {
+  const fileStream = startOffset != null
+    ? createReadStream(filePath, { start: startOffset, end: endOffset })
+    : createReadStream(filePath);
+  return parseJsonStream(fileStream, jsonPath, depth, knownCount, arrayOffset);
+}
+
+function extractFromText(
+  text: string,
+  jsonPath: string,
+  depth: number,
+  knownCount?: number,
+  arrayOffset?: number,
+): Promise<any> {
+  const textStream = Readable.from([text]);
+  return parseJsonStream(textStream, jsonPath, depth, knownCount, arrayOffset);
+}
+
 /** Minimal validity check.  A corrupted index from the earlier inString bug
  *  produces depth1 string/number values where truncated markers should be,
  *  causing the root-expansion loop to silently do nothing and fall through
  *  to the slow path.  We detect that pattern here and force a rebuild. */
 function isValidIndex(idx: Record<string, any>): boolean {
   if (!idx?.depth1 || typeof idx.depth1 !== "object") return false;
-  // depth1 has proper truncated markers → valid
   const hasMarker = Object.values(idx.depth1).some(
     (v: any) => v && typeof v === "object" && v.__truncated__ != null,
   );
@@ -361,11 +339,8 @@ function isValidIndex(idx: Record<string, any>): boolean {
   if (depth1Keys.length === 0) return false;
 
   const containerCount = idx.containers ? Object.keys(idx.containers).length : 0;
-  // Only root container ($) and no rootKeys → likely corrupted inString output
   if (containerCount === 1 && !idx.rootKeys) return false;
-  // Has non-root containers but no truncated markers → corrupted
   if (containerCount > 1) return false;
-  // Scalar-only file with no containers → valid
   return true;
 }
 
@@ -377,7 +352,6 @@ function loadOrBuildIndex(id: string, filePath: string): Record<string, any> | n
       if (isValidIndex(parsed)) return parsed;
     } catch { /* fall through to rebuild */ }
   }
-  // Rebuild the index on demand from the data file.
   try {
     const buf = readFileSync(filePath);
     const index = buildIndex(buf);
@@ -399,6 +373,137 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Missing or invalid 'id'" }, { status: 400 });
   }
 
+  // ── Remote entry (in-memory, no disk file) ───────────────────────────
+  const remoteEntry = getRemoteEntry(id);
+  if (remoteEntry) {
+    const re = remoteEntry;
+    if (jsonPath === "$" && depth === 1) {
+      if (re.depth1Snapshot) {
+        return NextResponse.json({ path: "$", depth: 1, value: re.depth1Snapshot });
+      }
+      return NextResponse.json({ status: "loading" });
+    }
+
+    const index = re.index;
+    if (!index) {
+      return NextResponse.json({ status: "loading" });
+    }
+
+    // Resolve path using the in-memory index, then Range-fetch
+    async function resolveRemotePath(path: string): Promise<any | undefined> {
+      const segs = path.replace(/^\$\.?/, "").split(".").filter(Boolean);
+      const idx = index as any;
+
+      // (a) Exact match in containers — Range-fetch that byte span
+      if (idx.containers?.[path]) {
+        const ci = idx.containers[path];
+        if (ci.offset != null) {
+          try {
+            const text = await rangeFetch(re.url, ci.offset, ci.endOffset);
+            return await extractFromText(text, "$", depth, ci.count, offset || undefined);
+          } catch { /* fall through */ }
+        }
+      }
+
+      // (b) Ancestor walk-up
+      if (idx.containers && segs.length > 0) {
+        for (let i = segs.length - 1; i >= 0; i--) {
+          const ancestorPath = (i === 0 ? "$" : "$." + segs.slice(0, i).join("."));
+          const anc = idx.containers[ancestorPath];
+          if (anc?.offset != null) {
+            const subPath = segs.slice(i).join(".");
+            try {
+              const text = await rangeFetch(re.url, anc.offset, anc.endOffset);
+              return await extractFromText(text, subPath, depth, anc.count, offset || undefined);
+            } catch { return undefined; }
+          }
+        }
+      }
+
+      // (c) rootKeys navigation
+      if (idx.rootKeys && segs.length > 0) {
+        const topKey = segs[0];
+        const keyInfo = idx.rootKeys[topKey];
+        if (keyInfo?.offset != null) {
+          const subPath = segs.length > 1 ? segs.slice(1).join(".") : "$";
+          try {
+            const text = await rangeFetch(re.url, keyInfo.offset, keyInfo.endOffset);
+            return await extractFromText(text, subPath, depth, keyInfo.count, offset || undefined);
+          } catch { return undefined; }
+        }
+      }
+
+      return undefined;
+    }
+
+    // Try path resolution for non-root paths
+    if (jsonPath !== "$") {
+      const val = await resolveRemotePath(jsonPath);
+      if (val !== undefined) {
+        return NextResponse.json({ path: jsonPath, depth, value: val });
+      }
+    }
+
+    // depth>1 at root — expand root containers via per-child Range-fetches
+    if (idxHasDepth1(index) && idxHasContainers(index) && jsonPath === "$" && depth > 1) {
+      const cm = index.containers as Record<string, { offset: number; endOffset?: number; count?: number; type: string }>;
+      const base = JSON.parse(JSON.stringify(index.depth1));
+      let anyExpanded = false;
+
+      for (const [key, marker] of Object.entries(base)) {
+        const m = marker as any;
+        if (!m || typeof m !== "object" || !m.__truncated__) continue;
+        const containerPath = `$.${key}`;
+        const ci = cm[containerPath];
+        if (!ci?.offset) continue;
+
+        if (m.__kind__ === "array") {
+          const items: any[] = [];
+          const maxItems = Math.min(10, ci.count ?? 10);
+          for (let i = 0; i < maxItems; i++) {
+            const childPath = `${containerPath}.${i}`;
+            const childInfo = cm[childPath];
+            if (childInfo?.offset != null) {
+              try {
+                const text = await rangeFetch(re.url, childInfo.offset, childInfo.endOffset);
+                const child = await extractFromText(text, "$", depth - 1, childInfo.count);
+                if (child !== undefined) items.push(child);
+                else items.push(truncatedMarker(childInfo.type as "object" | "array", childInfo.count ?? 0));
+              } catch {
+                items.push(truncatedMarker(childInfo.type as "object" | "array", childInfo.count ?? 0));
+              }
+            } else {
+              items.push({ __truncated__: true, __kind__: "object", __count__: 0 });
+            }
+          }
+          const remaining = (ci.count ?? 0) - maxItems;
+          if (remaining > 0) {
+            items.push(truncatedMarker("array", remaining));
+          }
+          base[key] = items;
+          anyExpanded = true;
+        } else {
+          try {
+            const text = await rangeFetch(re.url, ci.offset, ci.endOffset);
+            const expanded = await extractFromText(text, "$", depth - 1, ci.count);
+            if (expanded !== undefined) {
+              base[key] = expanded;
+              anyExpanded = true;
+            }
+          } catch { /* keep marker */ }
+        }
+      }
+
+      if (anyExpanded) {
+        return NextResponse.json({ path: "$", depth, value: base });
+      }
+    }
+
+    // No path resolved or index incomplete
+    return NextResponse.json({ status: "loading" });
+  }
+
+  // ── Local file (disk-based) ──────────────────────────────────────────
   const basePath = dataPath(id);
   if (!existsSync(basePath)) {
     return NextResponse.json(
@@ -407,24 +512,16 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  // ----- Pre-computed index (load or rebuild) -----
   const index = loadOrBuildIndex(id, basePath);
 
-  // depth=1 at root → instant from the depth1 snapshot
   if (index?.depth1 && jsonPath === "$" && depth === 1) {
     return NextResponse.json({ path: "$", depth: 1, value: index.depth1 });
   }
 
-  // Helper: resolve any path using the containers map or rootKeys.
-  // 1. If the exact path is in containers → direct byte-range seek (no nav).
-  // 2. If not, walk up to the deepest recorded ancestor and navigate from
-  //    that byte range — avoids scanning the whole file.
-  // 3. Fall back to rootKeys-based navigation (root-level byte range).
   async function resolvePath(path: string): Promise<any | undefined> {
     if (!index) return undefined;
     const segs = path.replace(/^\$\.?/, "").split(".").filter(Boolean);
 
-    // (a) Exact match in containers
     if (index.containers?.[path]) {
       const ci = index.containers[path];
       if (ci.offset != null) {
@@ -438,7 +535,6 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // (b) Ancestor walk-up: find deepest recorded container ancestor
     if (index.containers && segs.length > 0) {
       for (let i = segs.length - 1; i >= 0; i--) {
         const ancestorPath = (i === 0 ? "$" : "$." + segs.slice(0, i).join("."));
@@ -456,7 +552,6 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // (c) rootKeys navigation (root-level containers not in containers map)
     if (index.rootKeys && segs.length > 0) {
       const topKey = segs[0];
       const keyInfo = index.rootKeys[topKey];
@@ -475,7 +570,6 @@ export async function GET(req: NextRequest) {
     return undefined;
   }
 
-  // Try path resolution (containers → ancestor → rootKeys) for non-root paths.
   if (jsonPath !== "$") {
     const val = await resolvePath(jsonPath);
     if (val !== undefined) {
@@ -483,10 +577,6 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  // depth>1 at root → expand each root-level container by one level via
-  // per-child byte-range seeks.  This avoids parsing the entire container
-  // (e.g. the whole records array) — we seek directly to each child's
-  // container entry in the index and build only that child.
   if (index?.depth1 && index?.containers && jsonPath === "$" && depth > 1) {
     const cm = index.containers as Record<string, { offset: number; endOffset?: number; count?: number; type: string }>;
     const base = JSON.parse(JSON.stringify(index.depth1));
@@ -517,8 +607,6 @@ export async function GET(req: NextRequest) {
               items.push(truncatedMarker(childInfo.type as "object" | "array", childInfo.count ?? 0));
             }
           } else {
-            // Child not in index — insert placeholder; the tree view will
-            // lazy-load it on expand via resolvePath → ancestor walk-up.
             items.push({ __truncated__: true, __kind__: "object", __count__: 0 });
           }
         }
@@ -529,7 +617,6 @@ export async function GET(req: NextRequest) {
         base[key] = items;
         anyExpanded = true;
       } else {
-        // Root-level object container — single seek, expand one level
         try {
           const expanded = await extractFromFile(
             basePath, "$", depth - 1,
@@ -548,7 +635,6 @@ export async function GET(req: NextRequest) {
     }
   }
 
-  // ----- Slow path: full file scan (no index or path not resolved) -----
   let value: any;
   try {
     value = await extractFromFile(basePath, jsonPath, depth, undefined, undefined, undefined, offset || undefined);
@@ -564,4 +650,21 @@ export async function GET(req: NextRequest) {
   }
 
   return NextResponse.json({ path: jsonPath, depth, value });
+}
+
+async function rangeFetch(url: string, start: number, end?: number): Promise<string> {
+  if (end == null) end = start + 1024 * 1024; // default 1MB range
+  const res = await fetch(url, {
+    headers: { Range: `bytes=${start}-${end}` },
+  });
+  if (!res.ok) throw new Error(`Range fetch failed with ${res.status}`);
+  return res.text();
+}
+
+function idxHasDepth1(idx: any): boolean {
+  return !!(idx?.depth1 && typeof idx.depth1 === "object");
+}
+
+function idxHasContainers(idx: any): boolean {
+  return !!idx?.containers;
 }
