@@ -1,19 +1,15 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createReadStream } from "node:fs";
 import { dataPath, isValidId, readMeta } from "../../lib/uploadStore";
+import { getRemoteEntry } from "../../lib/remoteFileStore";
 
 export const dynamic = "force-dynamic";
 
-const MAX_LENGTH = 200_000; // guardrails a single request to ~200KB of text
+const MAX_LENGTH = 200_000;
 
 function readRange(filePath: string, start: number, length: number): Promise<Buffer> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
-    // start/end are byte offsets, so this is a direct seek — no scanning
-    // through preceding content the way line-counting required. That also
-    // fixes the actual bug: line-based windowing is meaningless for a
-    // minified JSON file that's one giant line, since "line 1" would BE
-    // the whole file. Character/byte offsets have no such degenerate case.
     const stream = createReadStream(filePath, { start, end: start + length - 1 });
     stream.on("data", (c) => chunks.push(c as Buffer));
     stream.on("end", () => resolve(Buffer.concat(chunks)));
@@ -31,6 +27,39 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Missing or invalid 'id'" }, { status: 400 });
   }
 
+  // Check remote store first
+  const remoteEntry = getRemoteEntry(id);
+  if (remoteEntry) {
+    try {
+      const res = await fetch(remoteEntry.url, {
+        headers: { Range: `bytes=${start}-${start + length - 1}` },
+      });
+
+      if (!res.ok) {
+        return NextResponse.json(
+          { error: `Remote server responded with ${res.status}` },
+          { status: 502 }
+        );
+      }
+
+      const text = await res.text();
+      const contentRange = res.headers.get("content-range");
+      let totalBytes: number | null = null;
+      if (contentRange) {
+        const match = contentRange.match(/\/(\d+)$/);
+        if (match) totalBytes = parseInt(match[1], 10);
+      }
+
+      return NextResponse.json({ start, text, totalBytes });
+    } catch (err: any) {
+      return NextResponse.json(
+        { error: `Failed to fetch from remote: ${err.message ?? "unknown error"}` },
+        { status: 502 }
+      );
+    }
+  }
+
+  // Fall back to local file
   const meta = await readMeta(id);
 
   let buf: Buffer;
@@ -45,14 +74,6 @@ export async function GET(req: NextRequest) {
     );
   }
 
-  // NOTE: this is a byte-offset read, not a codepoint-offset read. For
-  // JSON containing raw (non-escaped) multi-byte UTF-8 characters, a chunk
-  // boundary can occasionally land mid-character, and that one character
-  // renders wrong right at the seam. Pure-ASCII JSON — which covers the
-  // overwhelming majority of real payloads, since most serializers escape
-  // non-ASCII as \uXXXX by default — is unaffected. A fully correct version
-  // would decode with a small overlap on each side and trim to the nearest
-  // valid UTF-8 boundary.
   return NextResponse.json({
     start,
     text: buf.toString("utf8"),

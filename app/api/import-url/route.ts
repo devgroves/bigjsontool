@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
-import { createWriteStream, writeFileSync, readFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { ensureUploadDir, dataPath, writeMeta, indexFilePath } from "../../lib/uploadStore";
 import { buildIndex } from "../../lib/buildIndex";
 
@@ -38,9 +39,6 @@ export async function POST(req: NextRequest) {
     );
   }
 
-  await ensureUploadDir();
-  const id = randomUUID();
-
   let remoteResponse: Response;
   try {
     remoteResponse = await fetch(url, {
@@ -69,54 +67,48 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  const id = randomUUID();
   const fileName = urlObj.pathname.split("/").pop() || "remote.json";
-  const dp = dataPath(id);
-  const fileStream = createWriteStream(dp);
+  const contentLength = remoteResponse.headers.get("content-length");
+  const fileSize = contentLength ? parseInt(contentLength, 10) : 0;
 
-  let byteSize = 0;
-  let lineCount = 1;
-  const newline = Buffer.from("\n", "utf8")[0];
-
+  // Read the full response body into a buffer
+  let buf: Buffer;
   try {
+    const chunks: Uint8Array[] = [];
     const reader = remoteResponse.body.getReader();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (value) {
-        fileStream.write(value);
-        byteSize += value.byteLength;
-        for (let i = 0; i < value.byteLength; i++) {
-          if (value[i] === newline) lineCount++;
-        }
-      }
+      chunks.push(value);
     }
+    buf = Buffer.concat(chunks);
   } catch (err: any) {
-    fileStream.destroy();
     return NextResponse.json(
-      { error: `Download failed: ${err.message ?? "unknown error"}` },
+      { error: `Failed to read remote response: ${err.message ?? "unknown error"}` },
       { status: 502 }
     );
   }
 
-  await new Promise<void>((resolve, reject) => {
-    fileStream.end((err: Error | null) => (err ? reject(err) : resolve()));
-  });
-
+  // Save to disk and write metadata
+  await ensureUploadDir();
+  const dp = dataPath(id);
+  await writeFile(dp, buf);
   await writeMeta(id, {
     name: fileName,
-    size: byteSize,
-    lineCount,
+    size: buf.length,
+    lineCount: 0,
     uploadedAt: new Date().toISOString(),
   });
 
+  // Build index at download time so first json-level request is instant.
   try {
-    const fullBuf = readFileSync(dp);
-    const index = buildIndex(fullBuf);
+    const index = buildIndex(buf);
     writeFileSync(indexFilePath(id), JSON.stringify(index));
-  } catch {
-    // Non-critical — without an index the json-level route falls back
-    // to a full scan (slower but still correct).
+  } catch (error) {
+    // Index is a performance optimization — non-critical.
+    console.error("Failed to build index for URL import", id, fileName, error);
   }
 
-  return NextResponse.json({ id, name: fileName, size: byteSize, lineCount });
+  return NextResponse.json({ id, name: fileName, size: buf.length });
 }
