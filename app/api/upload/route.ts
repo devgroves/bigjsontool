@@ -1,101 +1,76 @@
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
-import { createWriteStream, writeFileSync } from "node:fs";
-import { Readable } from "node:stream";
+import { writeFile } from "node:fs/promises";
+import { writeFileSync } from "node:fs";
 import { ensureUploadDir, dataPath, writeMeta, indexFilePath } from "../../lib/uploadStore";
-import { BuildIndexStream } from "../../lib/BuildIndexStream";
-
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const Busboy = require("busboy");
+import { buildIndex } from "../../lib/buildIndex";
 
 export const dynamic = "force-dynamic";
+
+function countLines(buf: Buffer): number {
+  let count = 1;
+  for (let i = 0; i < buf.length; i++) {
+    if (buf[i] === 0x0a) count++; // "\n"
+  }
+  return count;
+}
 
 export async function POST(req: NextRequest) {
   await ensureUploadDir();
 
-  if (!req.body) {
+  let formData: FormData;
+  try {
+    formData = await req.formData();
+  } catch {
     return NextResponse.json(
-      { error: "No request body" },
+      { error: "Expected multipart/form-data with a 'file' field" },
       { status: 400 }
     );
   }
 
-  const contentType = req.headers.get("content-type") || "";
+  const file = formData.get("file");
+  if (!file || !(file instanceof File)) {
+    return NextResponse.json(
+      { error: "No file provided (expected multipart field 'file')" },
+      { status: 400 }
+    );
+  }
 
   const id = randomUUID();
+
+  // NOTE: formData()/arrayBuffer() bring the *whole* upload into the Node
+  // process's memory before we ever touch disk. That's fine up to a few
+  // hundred MB, but it's a real ceiling for true multi-GB uploads — a
+  // production version would parse the multipart stream incrementally and
+  // pipe straight to disk instead of buffering it first. This is a
+  // server-side memory concern (bounded by your Node process), which is a
+  // different failure mode than the browser-side crash this route change
+  // is fixing — but worth knowing it's still there.
+  const buf = Buffer.from(await file.arrayBuffer());
+  const lineCount = countLines(buf);
+
   const dp = dataPath(id);
-
-  let fileName = "upload.json";
-  let fileSize = 0;
-  let lineCount = 1;
-  let fileWriteDone: Promise<void> = Promise.resolve();
-  let indexDone: Promise<any> = Promise.resolve(null);
-
-  const bb = Busboy({ headers: { "content-type": contentType } });
-
-  bb.on("file", (_fieldname: string, fileStream: any, info: { filename: string }) => {
-    fileName = info.filename;
-    const outStream = createWriteStream(dp);
-    const indexer = new BuildIndexStream();
-
-    fileWriteDone = new Promise<void>((resolve, reject) => {
-      outStream.on("finish", resolve);
-      outStream.on("error", reject);
-    });
-
-    indexDone = new Promise<any>((resolve, reject) => {
-      indexer.on("complete", (index) => resolve(index));
-      indexer.on("error", reject);
-    });
-
-    fileStream.on("data", (data: Buffer) => {
-      fileSize += data.length;
-      for (let i = 0; i < data.length; i++) {
-        if (data[i] === 0x0a) lineCount++;
-      }
-      indexer.write(data);
-      if (!outStream.write(data)) {
-        fileStream.pause();
-        outStream.once("drain", () => fileStream.resume());
-      }
-    });
-
-    fileStream.on("end", () => {
-      outStream.end();
-      indexer.end();
-    });
-
-    fileStream.on("error", (err: Error) => {
-      outStream.destroy(err);
-      indexer.destroy(err);
-    });
-  });
-
-  const nodeStream = Readable.fromWeb(req.body as any);
-  nodeStream.pipe(bb);
-
-  await new Promise<void>((resolve, reject) => {
-    bb.on("close", resolve);
-    bb.on("error", (err: Error) => reject(err));
-  });
-
-  await fileWriteDone;
-  const index = await indexDone;
-
+  await writeFile(dp, buf);
   await writeMeta(id, {
-    name: fileName,
-    size: fileSize,
+    name: file.name,
+    size: buf.length,
     lineCount,
     uploadedAt: new Date().toISOString(),
   });
+  console.info("Saved upload", id, dp, file.name, buf.length, lineCount);
 
-  if (index) {
-    try {
-      writeFileSync(indexFilePath(id), JSON.stringify(index));
-    } catch (error) {
-      console.error("Failed to write index for upload", id, fileName, error);
+  // Build index at upload time so first json-level request is instant.
+  try {
+    const index = buildIndex(buf);
+    console.info("Built index for upload", id, indexFilePath(id), index);
+    writeFileSync(indexFilePath(id), JSON.stringify(index));
+  } catch (error) {
+    // Index is a performance optimization — non-critical.
+    console.error("Failed to build index for upload", id, file.name, error);
+    if (error instanceof Error) {
+      console.error(error.stack);
     }
   }
 
-  return NextResponse.json({ id, name: fileName, size: fileSize, lineCount });
+  return NextResponse.json({ id, name: file.name, size: buf.length, lineCount });
 }
