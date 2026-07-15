@@ -1,8 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
-import { createWriteStream, writeFileSync } from "node:fs";
+import { writeFileSync } from "node:fs";
+import { writeFile } from "node:fs/promises";
 import { ensureUploadDir, dataPath, writeMeta, indexFilePath } from "../../lib/uploadStore";
-import { BuildIndexStream } from "../../lib/BuildIndexStream";
+import { buildIndex } from "../../lib/buildIndex";
 
 export const dynamic = "force-dynamic";
 
@@ -68,53 +69,46 @@ export async function POST(req: NextRequest) {
 
   const id = randomUUID();
   const fileName = urlObj.pathname.split("/").pop() || "remote.json";
+  const contentLength = remoteResponse.headers.get("content-length");
+  const fileSize = contentLength ? parseInt(contentLength, 10) : 0;
 
-  await ensureUploadDir();
-  const dp = dataPath(id);
-  const fileStream = createWriteStream(dp);
-  const indexer = new BuildIndexStream();
-  const reader = remoteResponse.body.getReader();
-
-  let fileSize = 0;
-
-  const pump = async () => {
+  // Read the full response body into a buffer
+  let buf: Buffer;
+  try {
+    const chunks: Uint8Array[] = [];
+    const reader = remoteResponse.body.getReader();
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      fileSize += value.length;
-      indexer.write(value);
-      if (!fileStream.write(value)) {
-        await new Promise<void>((resolve) => fileStream.once("drain", resolve));
-      }
+      chunks.push(value);
     }
-    fileStream.end();
-    indexer.end();
-  };
+    buf = Buffer.concat(chunks);
+  } catch (err: any) {
+    return NextResponse.json(
+      { error: `Failed to read remote response: ${err.message ?? "unknown error"}` },
+      { status: 502 }
+    );
+  }
 
-  const [index] = await Promise.all([
-    new Promise<any>((resolve, reject) => {
-      indexer.on("complete", resolve);
-      indexer.on("error", reject);
-    }),
-    pump(),
-    new Promise<void>((resolve, reject) => {
-      fileStream.on("finish", resolve);
-      fileStream.on("error", reject);
-    }),
-  ]);
-
+  // Save to disk and write metadata
+  await ensureUploadDir();
+  const dp = dataPath(id);
+  await writeFile(dp, buf);
   await writeMeta(id, {
     name: fileName,
-    size: fileSize,
+    size: buf.length,
     lineCount: 0,
     uploadedAt: new Date().toISOString(),
   });
 
+  // Build index at download time so first json-level request is instant.
   try {
+    const index = buildIndex(buf);
     writeFileSync(indexFilePath(id), JSON.stringify(index));
   } catch (error) {
-    console.error("Failed to write index for URL import", id, fileName, error);
+    // Index is a performance optimization — non-critical.
+    console.error("Failed to build index for URL import", id, fileName, error);
   }
 
-  return NextResponse.json({ id, name: fileName, size: fileSize });
+  return NextResponse.json({ id, name: fileName, size: buf.length });
 }
