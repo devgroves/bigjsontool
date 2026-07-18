@@ -369,6 +369,23 @@ function setAtJsonPath(root: JsonValue, jsonPath: string, value: JsonValue): Jso
   return recur(root, 0);
 }
 
+/** Walks the already-materialized tree and collects the jsonPath of every
+ *  TruncatedMarker found — i.e. the current "frontier" the server hasn't
+ *  resolved yet. Used when the depth preset increases, so we only fetch
+ *  the delta from here instead of rebuilding the whole tree from root. */
+function collectTruncatedPaths(value: JsonValue | null, jsonPath: string, out: string[]) {
+  if (value == null) return;
+  if (isTruncatedMarker(value)) {
+    out.push(jsonPath);
+    return;
+  }
+  if (Array.isArray(value)) {
+    value.forEach((v, i) => collectTruncatedPaths(v, `${jsonPath}.${i}`, out));
+  } else if (isObject(value)) {
+    Object.entries(value).forEach(([k, v]) => collectTruncatedPaths(v, `${jsonPath}.${k}`, out));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Row rendering
 // ---------------------------------------------------------------------------
@@ -596,39 +613,108 @@ export default function JsonTreeView({
   const [serverError, setServerError] = useState<string | null>(null);
   const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
 
+  // Tracks how deep the current tree has actually been materialized —
+  // separate from `collapsed`, which is just the user's requested preset.
+  // Going from depth 2 -> 4 should only fetch the 2-level delta from the
+  // existing frontier, not rebuild the whole tree from root; going 4 -> 2
+  // should fetch nothing at all, since the data's already there.
+  const serverRootRef = useRef<JsonValue | null>(null);
+  useEffect(() => {
+    serverRootRef.current = serverRoot;
+  }, [serverRoot]);
+
+  const fetchedDepthRef = useRef(0);
+  const lastFileIdRef = useRef<string | null>(null);
+
   useEffect(() => {
     if (!fileId) {
       setServerRoot(null);
       setServerError(null);
+      fetchedDepthRef.current = 0;
+      lastFileIdRef.current = null;
       return;
     }
-    let cancelled = false;
-    setServerLoading(true);
-    setServerError(null);
 
-    // Fetch at the depth matching the current collapse preset.  The server
-    // fast-path (byte-offset seeking / rootKeys expansion) can serve
-    // depths 2-3 without a full file scan.  Capped at 3 so even the
-    // "true"/"function" presets don't trigger an overly deep response.
-    const fetchDepth = Math.min(presetToServerDepth(collapsed), 3);
-    fetch(`/api/json-level?id=${encodeURIComponent(fileId)}&path=%24&depth=${fetchDepth}`)
-      .then(async (res) => {
+    if (lastFileIdRef.current !== fileId) {
+      // Switched files — nothing from the previous tree carries over.
+      lastFileIdRef.current = fileId;
+      fetchedDepthRef.current = 0;
+      serverRootRef.current = null;
+      setServerRoot(null);
+    }
+
+    // Capped at 3 so even the "true"/"function" presets don't trigger an
+    // overly deep response in one shot.
+    const targetDepth = Math.min(presetToServerDepth(collapsed), 3);
+
+    if (targetDepth <= fetchedDepthRef.current && serverRootRef.current != null) {
+      return; // already materialized this deep — nothing to fetch
+    }
+
+    let cancelled = false;
+
+    (async () => {
+      setServerLoading(true);
+      setServerError(null);
+      try {
+        if (serverRootRef.current == null) {
+          // First load for this file: fetch root down to targetDepth.
+          const res = await fetch(
+            `/api/json-level?id=${encodeURIComponent(fileId)}&path=%24&depth=${targetDepth}`
+          );
+          const body = await res.json();
+          if (!res.ok) throw new Error(body?.error || `Request failed (${res.status})`);
+          if (!cancelled) {
+            setServerRoot(body.value);
+            fetchedDepthRef.current = targetDepth;
+          }
+          return;
+        }
+
+        // Resume from the current frontier (every still-truncated node)
+        // instead of rebuilding from root. One batch call, `delta` levels
+        // deep from each frontier node.
+        const frontier: string[] = [];
+        collectTruncatedPaths(serverRootRef.current, "$", frontier);
+        const delta = targetDepth - fetchedDepthRef.current;
+
+        if (frontier.length === 0) {
+          fetchedDepthRef.current = targetDepth; // already fully resolved
+          return;
+        }
+
+        const res = await fetch(`/api/json-level/batch`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ id: fileId, paths: frontier, depth: delta }),
+        });
         const body = await res.json();
         if (!res.ok) throw new Error(body?.error || `Request failed (${res.status})`);
-        if (!cancelled) setServerRoot(body.value);
-      })
-      .catch((e) => {
+        const values: Record<string, JsonValue> = body.values;
+
+        if (!cancelled) {
+          setServerRoot((prev) => {
+            let next = prev;
+            for (const jsonPath of frontier) {
+              if (next == null) break;
+              if (jsonPath in values) next = setAtJsonPath(next, jsonPath, values[jsonPath]);
+            }
+            return next;
+          });
+          fetchedDepthRef.current = targetDepth;
+        }
+      } catch (e: any) {
         if (!cancelled) setServerError(e.message || "Failed to load JSON from server");
-      })
-      .finally(() => {
+      } finally {
         if (!cancelled) setServerLoading(false);
-      });
+      }
+    })();
 
     return () => {
       cancelled = true;
     };
-    // Re-fetch the root view whenever the file or the requested depth preset
-    // changes. Per-node expansion beyond that is handled by loadPlaceholder.
+    // Re-runs whenever the file or the requested depth preset changes.
+    // Per-node expansion beyond the preset depth is handled by loadPlaceholder.
   }, [fileId, collapsed]);
 
   // Matches MAX_PREVIEW_SIZE on the server — offsets below this are
