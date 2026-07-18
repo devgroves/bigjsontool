@@ -4,7 +4,7 @@ import { useCallback, useRef, useState } from "react";
 import JsonEditor from "./components/JsonEditor";
 import Spinner from "./components/Spinner";
 
-type Status = "idle" | "uploading" | "streaming" | "downloading" | "done" | "error";
+type Status = "idle" | "uploading" | "streaming" | "downloading" | "indexing" | "done" | "error";
 
 function formatBytes(n: number) {
   if (n < 1024) return `${n} B`;
@@ -28,6 +28,9 @@ export default function Home() {
   // whole file as one string (that buffering is what crashed the tab on
   // large files before).
   const [fileId, setFileId] = useState<string | null>(null);
+  // Percent complete for the post-import index build (see waitForIndex).
+  // null while no build is in flight / not applicable.
+  const [indexProgress, setIndexProgress] = useState<number | null>(null);
 
   const abortRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
@@ -161,6 +164,46 @@ export default function Home() {
     []
   );
 
+  // Opens the SSE index-build stream for `id` and resolves once the server
+  // sends `done` (or rejects on `error`). Drives indexProgress along the
+  // way. This is what replaces the old "build index inline during
+  // import-url" step — that single-request build was slow enough on large
+  // files to trip gateway timeouts, so it's now a separate, streamed step
+  // the client explicitly waits on before treating the import as finished.
+  const waitForIndex = useCallback((id: string): Promise<void> => {
+    return new Promise((resolve, reject) => {
+      const es = new EventSource(`/api/import-index-stream?id=${encodeURIComponent(id)}`);
+
+      es.addEventListener("progress", (e) => {
+        try {
+          const { percent } = JSON.parse((e as MessageEvent).data);
+          if (typeof percent === "number") setIndexProgress(percent);
+        } catch {
+          // ignore malformed progress payloads
+        }
+      });
+
+      es.addEventListener("done", () => {
+        es.close();
+        setIndexProgress(100);
+        resolve();
+      });
+
+      es.addEventListener("error", (e) => {
+        es.close();
+        let message = "Failed to build index";
+        try {
+          const parsed = JSON.parse((e as MessageEvent).data ?? "{}");
+          if (parsed?.error) message = parsed.error;
+        } catch {
+          // EventSource also fires a plain "error" event on connection
+          // drops, which won't have a JSON payload — message stays generic.
+        }
+        reject(new Error(message));
+      });
+    });
+  }, []);
+
   const handleImportUrl = useCallback(async () => {
     const url = importUrl.trim();
     if (!url) return;
@@ -170,6 +213,7 @@ export default function Home() {
     setError(null);
     setImportedName(url.split("/").pop() || "remote.json");
     setFileId(null);
+    setIndexProgress(null);
     setStatus("downloading");
 
     const controller = new AbortController();
@@ -193,6 +237,11 @@ export default function Home() {
       setBytes(body.size);
       setElapsedMs(performance.now() - startTime);
       setFileId(body.id);
+
+      setStatus("indexing");
+      setIndexProgress(0);
+      await waitForIndex(body.id);
+
       setStatus("done");
     } catch (e: any) {
       if (e.name === "AbortError") {
@@ -202,10 +251,10 @@ export default function Home() {
         setError(e.message || "Something went wrong while importing the URL.");
       }
     }
-  }, [importUrl]);
+  }, [importUrl, waitForIndex]);
 
   const speed = elapsedMs > 0 ? bytes / (elapsedMs / 1000) : 0;
-  const busy = status === "streaming" || status === "uploading" || status === "downloading";
+  const busy = status === "streaming" || status === "uploading" || status === "downloading" || status === "indexing";
 
   return (
     <main className="wrap">
@@ -329,6 +378,12 @@ export default function Home() {
           <span className="label">Throughput</span>
           <span className="value">{formatBytes(speed)}/s</span>
         </div>
+        {status === "indexing" && (
+          <div className="stat">
+            <span className="label">Indexing</span>
+            <span className="value">{indexProgress ?? 0}%</span>
+          </div>
+        )}
         {error && <div className="error">{error}</div>}
       </section>
 
