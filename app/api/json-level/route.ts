@@ -400,7 +400,7 @@ export async function GET(req: NextRequest) {
         if (ci.offset != null) {
           try {
             const text = await rangeFetch(re.url, ci.offset, ci.endOffset);
-            return await extractFromText(text, "$", depth, ci.count, offset || undefined);
+            return await extractFromText(text, "$", depth, (ci.count ?? 0) - offset, offset || undefined);
           } catch { /* fall through */ }
         }
       }
@@ -414,7 +414,7 @@ export async function GET(req: NextRequest) {
             const subPath = segs.slice(i).join(".");
             try {
               const text = await rangeFetch(re.url, anc.offset, anc.endOffset);
-              return await extractFromText(text, subPath, depth, anc.count, offset || undefined);
+              return await extractFromText(text, subPath, depth, (anc.count ?? 0) - offset, offset || undefined);
             } catch { return undefined; }
           }
         }
@@ -428,7 +428,7 @@ export async function GET(req: NextRequest) {
           const subPath = segs.length > 1 ? segs.slice(1).join(".") : "$";
           try {
             const text = await rangeFetch(re.url, keyInfo.offset, keyInfo.endOffset);
-            return await extractFromText(text, subPath, depth, keyInfo.count, offset || undefined);
+            return await extractFromText(text, subPath, depth, (keyInfo.count ?? 0) - offset, offset || undefined);
           } catch { return undefined; }
         }
       }
@@ -522,13 +522,13 @@ export async function GET(req: NextRequest) {
     if (!index) return undefined;
     const segs = path.replace(/^\$\.?/, "").split(".").filter(Boolean);
 
-    if (index.containers?.[path]) {
+      if (index.containers?.[path]) {
       const ci = index.containers[path];
       if (ci.offset != null) {
         try {
           return await extractFromFile(
             basePath, "$", depth,
-            ci.offset, ci.endOffset, ci.count,
+            ci.offset, ci.endOffset, (ci.count ?? 0) - offset,
             offset || undefined,
           );
         } catch { /* fall through */ }
@@ -544,7 +544,7 @@ export async function GET(req: NextRequest) {
           try {
             return await extractFromFile(
               basePath, subPath, depth,
-              anc.offset, anc.endOffset, anc.count,
+              anc.offset, anc.endOffset, (anc.count ?? 0) - offset,
               offset || undefined,
             );
           } catch { return undefined; }
@@ -560,7 +560,7 @@ export async function GET(req: NextRequest) {
         try {
           return await extractFromFile(
             basePath, subPath, depth,
-            keyInfo.offset, keyInfo.endOffset, keyInfo.count,
+            keyInfo.offset, keyInfo.endOffset, (keyInfo.count ?? 0) - offset,
             offset || undefined,
           );
         } catch { return undefined; }

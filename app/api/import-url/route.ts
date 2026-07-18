@@ -1,9 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
-import { writeFileSync } from "node:fs";
 import { writeFile } from "node:fs/promises";
-import { ensureUploadDir, dataPath, writeMeta, indexFilePath } from "../../lib/uploadStore";
-import { buildIndex } from "../../lib/buildIndex";
+import { ensureUploadDir, dataPath, writeMeta } from "../../lib/uploadStore";
 
 export const dynamic = "force-dynamic";
 
@@ -101,14 +99,12 @@ export async function POST(req: NextRequest) {
     uploadedAt: new Date().toISOString(),
   });
 
-  // Build index at download time so first json-level request is instant.
-  try {
-    const index = buildIndex(buf);
-    writeFileSync(indexFilePath(id), JSON.stringify(index));
-  } catch (error) {
-    // Index is a performance optimization — non-critical.
-    console.error("Failed to build index for URL import", id, fileName, error);
-  }
+  // NOTE: index building used to happen synchronously right here
+  // (buildIndex(buf) + writeFileSync). For large files that single-request
+  // scan was slow enough to trip gateway/proxy timeouts on THIS response.
+  // It's now a separate step: the client calls GET /api/import-index-stream
+  // (SSE) with this id right after receiving the response below, and that
+  // route builds + persists the index while streaming progress back.
 
   return NextResponse.json({ id, name: fileName, size: buf.length });
 }
