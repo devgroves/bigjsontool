@@ -2,7 +2,6 @@
 
 import type React from "react";
 import {
-  useMemo,
   useState,
   useCallback,
   useRef,
@@ -19,9 +18,6 @@ type JsonValue =
   | JsonValue[]
   | { [key: string]: JsonValue };
 
-/** Server-sent stand-in for a container whose contents weren't sent yet.
- *  Field names are deliberately unusual so they can't collide with real
- *  JSON data. See app/api/json-level/route.ts for the producing side. */
 interface TruncatedMarker {
   __truncated__: true;
   __kind__: "object" | "array";
@@ -37,26 +33,12 @@ function isTruncatedMarker(v: JsonValue): v is TruncatedMarker & JsonValue {
   );
 }
 
-/** Mirrors the common `collapsed` prop shape: depth number, true/false, or
- *  a custom per-node predicate ("function" mode). */
 type CollapsedSetting = number | boolean | "function";
 
 interface JsonTreeViewProps {
-  /** Raw JSON text. Used when `fileId` is not set — parsed locally, same
-   *  as before. */
-  source: string;
-  /** When set, the tree is populated from the server (/api/json-level)
-   *  instead of parsing `source` locally: only the requested depth is
-   *  fetched, and expanding a node past that depth fetches deeper on
-   *  demand. This is what makes huge imported/streamed files cheap to
-   *  browse — the browser never holds or walks the full parsed object. */
-  fileId?: string | null;
-  /** Collapse object/array nodes deeper than this on first render. Default 2. */
+  fileId: string;
   defaultExpandDepth?: number;
-  /** Row height in px, used by the virtualized list. Default 22. */
   rowHeight?: number;
-  /** Arrays longer than this are grouped into expandable chunks, unless
-   *  `ignoreLargeArray` is enabled. Default 100. */
   groupSize?: number;
 }
 
@@ -84,40 +66,18 @@ function formatPrimitive(v: JsonValue): string {
   return String(v);
 }
 
-/** Sample heuristic used for the "function" collapsed preset: collapse
- *  containers past a size threshold instead of a flat depth cutoff. Only
- *  applies in local-parse mode — see presetToServerDepth for the
- *  server-mode approximation. */
 function defaultCollapseFn(_key: string | null, value: JsonValue): boolean {
   if (Array.isArray(value)) return value.length > 5;
   if (isObject(value)) return Object.keys(value).length > 8;
   return false;
 }
 
-/** Server-mode depth requests are a flat number, so the true/false/"function"
- *  presets have to be approximated: true = expand deep (capped so a huge
- *  file doesn't get fully materialized), false = just the root's immediate
- *  children, "function" ≈ a flat depth since its per-node size heuristic
- *  isn't replicated server-side. */
 function presetToServerDepth(preset: CollapsedSetting): number {
   if (typeof preset === "number") return preset;
   if (preset === true) return 8;
   if (preset === false) return 1;
   return 3;
 }
-
-// ---------------------------------------------------------------------------
-// Flattening: the tree is walked once per render into a flat array of rows.
-// Only rows that are actually visible (i.e. every ancestor is expanded) get
-// produced, and that flat array is what react-window virtualizes — so a
-// 50,000-element array only ever mounts the handful of rows in the viewport.
-//
-// Two path schemes are tracked side by side: `path` is a UI identifier used
-// for expand/collapse state (it includes synthetic "#chunk" segments for
-// grouped arrays), while `jsonPath` is the real dot-path into the JSON data
-// (records.3.meta, etc.) with no synthetic segments — it's what the server
-// needs to navigate to a node for a level fetch.
-// ---------------------------------------------------------------------------
 
 type Row =
   | {
@@ -196,8 +156,6 @@ function flatten(
 ) {
   if (isTruncatedMarker(value)) {
     const marker = value as unknown as TruncatedMarker;
-    // For array placeholders, derive the parent array path and item offset
-    // so we can paginate (load next batch from server on click).
     const lastSeg = jsonPath.split('.').pop()!;
     const isArrayItem = /^\d+$/.test(lastSeg) && jsonPath.includes('.');
     const parentJsonPath = isArrayItem ? jsonPath.substring(0, jsonPath.lastIndexOf('.')) : jsonPath;
@@ -315,9 +273,6 @@ function flatten(
   });
 }
 
-/** Appends items to an array at `jsonPath`, replacing `newItems.length` items
- *  starting at `offset`.  Used for pagination — clicking the "N items remaining"
- *  placeholder fetches the next batch and splices it into the array. */
 function extendArrayAtPath(root: JsonValue, jsonPath: string, newItems: JsonValue[], offset: number): JsonValue {
   const segments = jsonPath.replace(/^\$\.?/, "").split(".").filter(Boolean);
   function recur(node: JsonValue, idx: number): JsonValue {
@@ -342,9 +297,6 @@ function extendArrayAtPath(root: JsonValue, jsonPath: string, newItems: JsonValu
   return recur(root, 0);
 }
 
-/** Immutably replaces the value at `jsonPath` inside `root` — used to splice
- *  a freshly-fetched subtree back into the tree after expanding a
- *  server-truncated node. */
 function setAtJsonPath(root: JsonValue, jsonPath: string, value: JsonValue): JsonValue {
   if (jsonPath === "$" || jsonPath === "") return value;
   const segments = jsonPath.replace(/^\$\.?/, "").split(".").filter(Boolean);
@@ -369,10 +321,6 @@ function setAtJsonPath(root: JsonValue, jsonPath: string, value: JsonValue): Jso
   return recur(root, 0);
 }
 
-/** Walks the already-materialized tree and collects the jsonPath of every
- *  TruncatedMarker found — i.e. the current "frontier" the server hasn't
- *  resolved yet. Used when the depth preset increases, so we only fetch
- *  the delta from here instead of rebuilding the whole tree from root. */
 function collectTruncatedPaths(value: JsonValue | null, jsonPath: string, out: string[]) {
   if (value == null) return;
   if (isTruncatedMarker(value)) {
@@ -385,10 +333,6 @@ function collectTruncatedPaths(value: JsonValue | null, jsonPath: string, out: s
     Object.entries(value).forEach(([k, v]) => collectTruncatedPaths(v, `${jsonPath}.${k}`, out));
   }
 }
-
-// ---------------------------------------------------------------------------
-// Row rendering
-// ---------------------------------------------------------------------------
 
 function ChevronIcon({ expanded }: { expanded: boolean }) {
   return (
@@ -537,11 +481,6 @@ const RowRenderer = memo(function RowRenderer({
   );
 });
 
-// ---------------------------------------------------------------------------
-// Size measurement (no extra dependency — same ResizeObserver pattern
-// already used in JsonEditor.tsx)
-// ---------------------------------------------------------------------------
-
 function useElementSize<T extends HTMLElement>() {
   const ref = useRef<T | null>(null);
   const [size, setSize] = useState({ width: 0, height: 0 });
@@ -560,10 +499,6 @@ function useElementSize<T extends HTMLElement>() {
   return [ref, size] as const;
 }
 
-// ---------------------------------------------------------------------------
-// Main component
-// ---------------------------------------------------------------------------
-
 const PRESETS: { label: string; value: CollapsedSetting }[] = [
   { label: "0", value: 0 },
   { label: "1", value: 1 },
@@ -574,30 +509,12 @@ const PRESETS: { label: string; value: CollapsedSetting }[] = [
   { label: "function", value: "function" },
 ];
 
-function parseJson(source: string): { ok: true; value: JsonValue | null } | { ok: false; error: string } {
-  try {
-    if (source.trim() === "") return { ok: true, value: null };
-    return { ok: true, value: JSON.parse(source) as JsonValue };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message : "Invalid JSON" };
-  }
-}
-
 export default function JsonTreeView({
-  source,
-  fileId = null,
+  fileId,
   defaultExpandDepth = 2,
   rowHeight = 22,
   groupSize = 100,
 }: JsonTreeViewProps) {
-  // --- Local-parse mode (fileId not set): unchanged from before -----------
-  const [debouncedSource, setDebouncedSource] = useState(source);
-  useEffect(() => {
-    const id = setTimeout(() => setDebouncedSource(source), 200);
-    return () => clearTimeout(id);
-  }, [source]);
-  const localParsed = useMemo(() => parseJson(debouncedSource), [debouncedSource]);
-
   const [collapsed, setCollapsed] = useState<CollapsedSetting>(defaultExpandDepth);
   const [ignoreLargeArray, setIgnoreLargeArray] = useState(false);
   const [expandedOverrides, setExpandedOverrides] = useState<Map<string, boolean>>(
@@ -605,19 +522,11 @@ export default function JsonTreeView({
   );
   const [chunkExpanded, setChunkExpanded] = useState<Set<string>>(new Set());
 
-  // --- Server mode (fileId set): fetch a depth-limited subtree instead of
-  // parsing `source` at all. Containers beyond the fetched depth arrive as
-  // TruncatedMarker placeholders that get fetched individually on expand. --
   const [serverRoot, setServerRoot] = useState<JsonValue | null>(null);
   const [serverLoading, setServerLoading] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
   const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
 
-  // Tracks how deep the current tree has actually been materialized —
-  // separate from `collapsed`, which is just the user's requested preset.
-  // Going from depth 2 -> 4 should only fetch the 2-level delta from the
-  // existing frontier, not rebuild the whole tree from root; going 4 -> 2
-  // should fetch nothing at all, since the data's already there.
   const serverRootRef = useRef<JsonValue | null>(null);
   useEffect(() => {
     serverRootRef.current = serverRoot;
@@ -627,28 +536,17 @@ export default function JsonTreeView({
   const lastFileIdRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!fileId) {
-      setServerRoot(null);
-      setServerError(null);
-      fetchedDepthRef.current = 0;
-      lastFileIdRef.current = null;
-      return;
-    }
-
     if (lastFileIdRef.current !== fileId) {
-      // Switched files — nothing from the previous tree carries over.
       lastFileIdRef.current = fileId;
       fetchedDepthRef.current = 0;
       serverRootRef.current = null;
       setServerRoot(null);
     }
 
-    // Capped at 3 so even the "true"/"function" presets don't trigger an
-    // overly deep response in one shot.
     const targetDepth = Math.min(presetToServerDepth(collapsed), 3);
 
     if (targetDepth <= fetchedDepthRef.current && serverRootRef.current != null) {
-      return; // already materialized this deep — nothing to fetch
+      return;
     }
 
     let cancelled = false;
@@ -658,7 +556,6 @@ export default function JsonTreeView({
       setServerError(null);
       try {
         if (serverRootRef.current == null) {
-          // First load for this file: fetch root down to targetDepth.
           const res = await fetch(
             `/api/json-level?id=${encodeURIComponent(fileId)}&path=%24&depth=${targetDepth}`
           );
@@ -671,15 +568,12 @@ export default function JsonTreeView({
           return;
         }
 
-        // Resume from the current frontier (every still-truncated node)
-        // instead of rebuilding from root. One batch call, `delta` levels
-        // deep from each frontier node.
         const frontier: string[] = [];
         collectTruncatedPaths(serverRootRef.current, "$", frontier);
         const delta = targetDepth - fetchedDepthRef.current;
 
         if (frontier.length === 0) {
-          fetchedDepthRef.current = targetDepth; // already fully resolved
+          fetchedDepthRef.current = targetDepth;
           return;
         }
 
@@ -713,23 +607,15 @@ export default function JsonTreeView({
     return () => {
       cancelled = true;
     };
-    // Re-runs whenever the file or the requested depth preset changes.
-    // Per-node expansion beyond the preset depth is handled by loadPlaceholder.
   }, [fileId, collapsed]);
 
-  // Matches MAX_PREVIEW_SIZE on the server — offsets below this are
-  // individual item placeholders, offsets at or above are batch markers.
   const INDIVIDUAL_ITEM_THRESHOLD = 10;
 
   const loadPlaceholder = useCallback(
     (jsonPath: string, parentJsonPath: string, offset: number) => {
-      if (!fileId) return;
       setLoadingPaths((prev) => new Set(prev).add(jsonPath));
       const phDepth = Math.min(presetToServerDepth(collapsed), 3);
 
-      // Offsets below the threshold are individual items — fetch the specific
-      // path and replace in place.  Offsets at or above the threshold are batch
-      // markers — fetch from the parent with offset and splice in the results.
       const isBatch = offset >= INDIVIDUAL_ITEM_THRESHOLD && offset > 0;
       const url = isBatch
         ? `/api/json-level?id=${encodeURIComponent(fileId)}&path=${encodeURIComponent(parentJsonPath)}&depth=${phDepth}&offset=${offset}`
@@ -749,7 +635,6 @@ export default function JsonTreeView({
           });
         })
         .catch(() => {
-          // Best-effort: leave the placeholder in place so the user can retry.
         })
         .finally(() => {
           setLoadingPaths((prev) => {
@@ -762,14 +647,6 @@ export default function JsonTreeView({
     [fileId, collapsed]
   );
 
-  const parsed = useMemo<{ ok: true; value: JsonValue | null } | { ok: false; error: string }>(() => {
-    if (!fileId) return localParsed;
-    if (serverError) return { ok: false, error: serverError };
-    return { ok: true, value: serverRoot };
-  }, [fileId, serverError, serverRoot, localParsed]);
-
-  // Changing a preset (or the ignoreLargeArray toggle) resets any manual
-  // per-node overrides so the new setting applies cleanly.
   useEffect(() => {
     setExpandedOverrides(new Map());
     setChunkExpanded(new Set());
@@ -792,13 +669,10 @@ export default function JsonTreeView({
     });
   }, []);
 
-  // Rows are computed off the synchronous render path: we flip `isComputing`
-  // on immediately (cheap state update, paints right away), then let the
-  // browser actually paint that loader before running the potentially heavy
-  // flatten() pass. This is what makes the loader show up even for a single
-  // expand/collapse click on a huge array, not just on initial load.
   const [rows, setRows] = useState<Row[]>([]);
   const [isComputing, setIsComputing] = useState(true);
+
+  const parsedError = serverError;
 
   useEffect(() => {
     setIsComputing(true);
@@ -808,7 +682,7 @@ export default function JsonTreeView({
       setTimeout(() => {
         if (cancelled) return;
 
-        if (!parsed.ok || parsed.value === null) {
+        if (parsedError || serverRoot === null) {
           setRows([]);
           setIsComputing(false);
           return;
@@ -823,7 +697,7 @@ export default function JsonTreeView({
           loadingPaths,
         };
         const out: Row[] = [];
-        flatten(null, parsed.value, 0, "$", "$", true, ctx, out);
+        flatten(null, serverRoot, 0, "$", "$", true, ctx, out);
 
         if (!cancelled) {
           setRows(out);
@@ -836,25 +710,18 @@ export default function JsonTreeView({
       cancelled = true;
       cancelAnimationFrame(raf);
     };
-  }, [parsed, expandedOverrides, chunkExpanded, collapsed, groupSize, ignoreLargeArray, loadingPaths]);
+  }, [serverRoot, expandedOverrides, chunkExpanded, collapsed, groupSize, ignoreLargeArray, loadingPaths, parsedError]);
 
-  // Waiting on the debounce (source still arriving) counts as loading too —
-  // only relevant in local-parse mode, since server mode has its own
-  // serverLoading flag.
-  const isStreamingIn = !fileId && debouncedSource !== source;
-  const isLoading = isStreamingIn || isComputing || (fileId ? serverLoading : false);
+  const isLoading = isComputing || serverLoading;
 
   const [bodyRef, bodySize] = useElementSize<HTMLDivElement>();
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
 
-  // Reset scroll position when the underlying row set changes shape
-  // drastically (e.g. a fresh preset), so we don't end up "stuck" past
-  // the new, possibly shorter, content.
   useEffect(() => {
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
     setScrollTop(0);
-  }, [collapsed, ignoreLargeArray, parsed.ok]);
+  }, [collapsed, ignoreLargeArray, serverRoot]);
 
   const handleScroll = useCallback((e: React.UIEvent<HTMLDivElement>) => {
     setScrollTop(e.currentTarget.scrollTop);
@@ -876,7 +743,7 @@ export default function JsonTreeView({
     <div className="jt-pane" style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <div className="jt-toolbar">
         <span className="jt-toolbar-title">
-          Tree view{fileId ? " (server-fetched by level)" : ""}
+          Tree view (server-fetched by level)
         </span>
         <div className="jt-toolbar-actions">
           {PRESETS.map((p) => (
@@ -906,10 +773,10 @@ export default function JsonTreeView({
         ref={bodyRef}
         style={{ flex: 1, minHeight: 0, position: "relative" }}
       >
-        {!parsed.ok ? (
+        {parsedError ? (
           <div className="jt-error">
-            <div className="jt-error-title">Invalid JSON</div>
-            <div className="jt-error-detail">{parsed.error}</div>
+            <div className="jt-error-title">Error</div>
+            <div className="jt-error-detail">{parsedError}</div>
           </div>
         ) : rows.length === 0 && !isLoading ? (
           <div className="jt-empty">Empty</div>
@@ -919,7 +786,6 @@ export default function JsonTreeView({
             onScroll={handleScroll}
             style={{ height: "100%", width: "100%", overflow: "auto", position: "relative" }}
           >
-            {/* Spacer that gives the scrollbar the full (virtual) content height */}
             <div style={{ height: totalHeight, position: "relative" }}>
               {visibleRows.map((row, i) => (
                 <RowRenderer
@@ -936,7 +802,7 @@ export default function JsonTreeView({
           </div>
         )}
 
-        {isLoading && parsed.ok && (
+        {isLoading && !parsedError && (
           <div
             className="jt-loading-overlay"
             style={{
@@ -956,9 +822,7 @@ export default function JsonTreeView({
             <Spinner
               size={16}
               label={
-                isStreamingIn
-                  ? "Waiting for more data…"
-                  : fileId && serverLoading
+                serverLoading
                   ? "Fetching level from server…"
                   : "Preparing tree…"
               }

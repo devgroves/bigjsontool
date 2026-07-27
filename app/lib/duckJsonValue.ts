@@ -1,15 +1,52 @@
 import duckdb from "duckdb";
+import { promises as fs } from 'fs';
+import { join } from 'path';
+import os from 'os';
 
 /**
- * Converts the client's dot-notation path ("$", "$.conversations",
- * "$.conversations.3.meta") into real DuckDB JSONPath ($."conversations"[3]."meta").
- *
- * NOTE: numeric segments are assumed to be array indices. A JSON object with
- * a purely-numeric string key would be misread as an index — this ambiguity
- * is inherited from the client's path scheme, which doesn't mark whether a
- * segment came from an object or an array. Only matters if your data has
- * numeric-string object keys.
+ * Logs the current system RAM usage.
+ * @param label A short string that will appear in the log line (e.g., "BEFORE TRY").
  */
+function logSystemMemory(label: string): void {
+  const total = os.totalmem(); // bytes
+  const free  = os.freemem();  // bytes
+  const used  = total - free;
+
+  const mb = (b: number) => Number((b / 1024 / 1024).toFixed(2));
+
+  console.info(
+    `[${new Date().toISOString()}] ${label} – RAM: ` +
+    `total=${mb(total)} MB, used=${mb(used)} MB, free=${mb(free)} MB`
+  );
+}
+
+const DEBUG = process.env.DUCK_DEBUG !== "0"; // set DUCK_DEBUG=0 to silence
+
+function log(...args: any[]) {
+  if (DEBUG) console.info("[duckJsonValue]", new Date().toISOString(), ...args);
+}
+function logErr(...args: any[]) {
+  console.error("[duckJsonValue:ERROR]", new Date().toISOString(), ...args);
+}
+
+// No cache. Every call opens a fresh in-memory DB, runs its query,
+// and closes the connection/db so nothing lingers between requests.
+function openDb(): { db: duckdb.Database; conn: duckdb.Connection } {
+  const db = new duckdb.Database(":memory:");
+  const conn = db.connect();
+  return { db, conn };
+}
+
+function closeDb(db: duckdb.Database, conn: duckdb.Connection, tag: string) {
+  conn.close((err) => {
+    if (err) logErr(`[${tag}] conn.close error`, err);
+    db.close((err2) => {
+      if (err2) logErr(`[${tag}] db.close error`, err2);
+      else log(`[${tag}] db closed`);
+    });
+  });
+}
+
 export function dotPathToJsonPath(dotPath: string): string {
   if (!dotPath || dotPath === "$") return "$";
   const segments = dotPath.replace(/^\$\.?/, "").split(".").filter((s) => s.length > 0);
@@ -27,7 +64,7 @@ export function dotPathToJsonPath(dotPath: string): string {
 
 interface DescribedNode {
   nodeId: number;
-  nodeType: string | null; // 'OBJECT' | 'ARRAY' | 'VARCHAR' | 'BIGINT' | ... | null (path not found)
+  nodeType: string | null;
   keys: string[] | null;
   arrLen: number | null;
   scalarValue: any;
@@ -35,72 +72,131 @@ interface DescribedNode {
 
 function allRows(conn: duckdb.Connection, sql: string, params: any[]): Promise<any[]> {
   return new Promise((resolve, reject) => {
-    conn.all(sql, ...params, (err: Error | null, rows: any[]) => (err ? reject(err) : resolve(rows)));
+    const t0 = Date.now();
+    conn.all(sql, ...params, (err: Error | null, rows: any[]) => {
+      const ms = Date.now() - t0;
+      if (err) {
+        logErr("query failed after", ms, "ms:", err.message);
+        reject(err);
+      } else {
+        log("query ok:", rows.length, "row(s) in", ms, "ms");
+        resolve(rows);
+      }
+    });
   });
 }
 
-/**
- * Single read_text scan describing every target path at once: its type,
- * its keys (if OBJECT), its length (if ARRAY), or its resolved scalar value
- * (if a leaf). Batching multiple targets into one query is what lets a
- * whole BFS level cost exactly one file scan, no matter how many siblings
- * are in it.
- */
+function runOne(
+  conn: duckdb.Connection,
+  sql: string,
+  params: any[]
+): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const t0 = Date.now();
+    conn.all(sql, ...params, (err: Error | null, rows: any[]) => {
+      const ms = Date.now() - t0;
+      if (err) {
+        logErr("query failed after", ms, "ms:", err.message, "\nSQL:", sql);
+        return reject(err);
+      }
+      log("query ok in", ms, "ms:", sql.split("\n")[0].trim());
+      resolve(rows[0]);
+    });
+  });
+}
+
+async function describeOneNode(
+  conn: duckdb.Connection,
+  filePath: string,
+  jpath: string
+): Promise<{ nodeType: string | null; keys: string[] | null; arrLen: number | null; scalarValue: any }> {
+  // Step 1: just the type. Cheap — no keys, no length, no value extraction yet.
+  const typeRow = await runOne(
+    conn,
+    `SELECT json_type(content -> ?) AS node_type FROM read_text(?)`,
+    [jpath, filePath]
+  );
+  // log the json type for debugging
+  log("describeOneNode types: --->", { filePath, jpath, nodeType: typeRow?.node_type ?? null });
+
+  const nodeType: string | null = typeRow?.node_type ?? null;
+
+  // Step 2: exactly one follow-up query, chosen by what step 1 told us.
+  if (nodeType === "OBJECT") {
+    const row = await runOne(
+      conn,
+      `SELECT json_keys(content -> ?) AS all_keys FROM read_text(?)`,
+      [jpath, filePath]
+    );
+    log("describeOneNode keys: --->", { filePath, jpath, keys: row?.all_keys ?? null });
+    return { nodeType, keys: row?.all_keys ?? null, arrLen: null, scalarValue: null };
+  }
+
+  if (nodeType === "ARRAY") {
+    const row = await runOne(
+      conn,
+      `SELECT json_array_length(content -> ?) AS arr_len FROM read_text(?)`,
+      [jpath, filePath]
+    );
+    log("describeOneNode arr_len: --->", { filePath, jpath, arrLen: row?.arr_len ?? null });
+    const arrLen = row?.arr_len == null ? null : Number(row.arr_len);
+    return { nodeType, keys: null, arrLen, scalarValue: null };
+  }
+
+  if (nodeType == null) {
+    // Path didn't resolve to anything.
+    return { nodeType: null, keys: null, arrLen: null, scalarValue: null };
+  }
+
+  // Scalar (STRING, NUMBER, BOOLEAN, NULL, etc.) — only now do we extract the value.
+  const row = await runOne(
+    conn,
+    `SELECT (content -> ?) AS scalar_json FROM read_text(?)`,
+    [jpath, filePath]
+  );
+  let scalarValue: any = null;
+  const sj = row?.scalar_json;
+  if (sj != null) {
+    try {
+      scalarValue = JSON.parse(sj);
+    } catch {
+      scalarValue = sj;
+    }
+  }
+  return { nodeType, keys: null, arrLen: null, scalarValue };
+}
+
 export async function describeNodesBatch(
   filePath: string,
   targets: { nodeId: number; jpath: string }[]
 ): Promise<DescribedNode[]> {
   if (targets.length === 0) return [];
+  log("describeNodesBatch", { filePath, targetCount: targets.length, sample: targets.slice(0, 3) });
 
-  const db = new duckdb.Database(":memory:");
-  const conn = db.connect();
+  const { db, conn } = openDb();
+  logSystemMemory('BEFORE TRY');
   try {
-    const valuesSql = targets.map(() => `(?::BIGINT, ?::VARCHAR)`).join(", ");
-    const valueParams = targets.flatMap((t) => [t.nodeId, t.jpath]);
+    // await new Promise<void>((resolve, reject) => {
+    //   conn.exec("SET memory_limit = '2GB';", (err) => (err ? reject(err) : resolve()));
+    // });
 
-    const sql = `
-      WITH src AS (SELECT content FROM read_text(?)),
-      targets(node_id, jpath) AS (VALUES ${valuesSql})
-      SELECT
-        t.node_id,
-        json_type(s.content, t.jpath) AS node_type,
-        json_keys(s.content, t.jpath) AS all_keys,
-        json_array_length(s.content, t.jpath) AS arr_len,
-        CASE WHEN json_type(s.content, t.jpath) NOT IN ('OBJECT', 'ARRAY')
-             THEN json_extract(s.content, t.jpath)
-        END AS scalar_json
-      FROM src s CROSS JOIN targets t;
-    `;
-
-    const rows = await allRows(conn, sql, [filePath, ...valueParams]);
-    const byId = new Map(rows.map((r) => [Number(r.node_id), r]));
-
-    return targets.map((t) => {
-      const r = byId.get(t.nodeId);
-      if (!r) return { nodeId: t.nodeId, nodeType: null, keys: null, arrLen: null, scalarValue: null };
-
-      let scalarValue: any = null;
-      if (r.scalar_json != null) {
-        try {
-          scalarValue = JSON.parse(r.scalar_json);
-        } catch {
-          scalarValue = null;
-        }
-      }
-
-      return {
-        nodeId: t.nodeId,
-        nodeType: r.node_type,
-        keys: r.all_keys ?? null,
-        arrLen: r.arr_len === null || r.arr_len === undefined ? null : Number(r.arr_len),
-        scalarValue,
-      };
-    });
+    // One simple, verified query per node. No CTE, no VALUES, no join.
+    const results = await Promise.all(
+      targets.map(async (t) => {
+        const d = await describeOneNode(conn, filePath, t.jpath);
+        return { nodeId: t.nodeId, ...d };
+      })
+    );
+    return results;
+  } catch (e) {
+    logErr("describeNodesBatch failed", { filePath, targetCount: targets.length }, e);
+    throw e;
   } finally {
-    conn.close();
-    db.close(() => {});
+    logSystemMemory('BEFORE CLOSE');
+    closeDb(db, conn, "describeNodesBatch");
   }
 }
+
 
 interface PendingSlot {
   jpath: string;
@@ -108,21 +204,16 @@ interface PendingSlot {
   setValue: (v: any) => void;
 }
 
-/**
- * Resolves a set of pending slots level-by-level. Each level is exactly one
- * read_text scan covering every node currently pending in that level,
- * regardless of how many siblings there are — this is what keeps a
- * wide-but-shallow expand cheap, and keeps total scans equal to the
- * requested depth rather than growing with breadth.
- */
 async function resolveFrontier(
   filePath: string,
   initialFrontier: PendingSlot[],
   childLimit: number
 ): Promise<void> {
   let frontier = initialFrontier;
+  let level = 0;
 
   while (frontier.length > 0) {
+    log("resolveFrontier level", level, "size", frontier.length);
     const targets = frontier.map((f, i) => ({ nodeId: i, jpath: f.jpath }));
     const described = await describeNodesBatch(filePath, targets);
     const next: PendingSlot[] = [];
@@ -174,24 +265,23 @@ async function resolveFrontier(
         return;
       }
 
-      // Scalar (or missing path, resolved as null).
       slot.setValue(d.scalarValue ?? null);
     });
 
     frontier = next;
+    level++;
   }
+
+  log("resolveFrontier done after", level, "level(s)");
 }
 
-/**
- * Root call: materializes `dotPath`'s value down to `depth` levels, in the
- * TruncatedMarker shape the client's JsonTreeView expects.
- */
 export async function fetchLevelValue(
   filePath: string,
   dotPath: string,
   depth: number,
   childLimit = 10
 ): Promise<any> {
+  log("fetchLevelValue", { filePath, dotPath, depth, childLimit });
   const jpath = dotPathToJsonPath(dotPath);
   let result: any = null;
   await resolveFrontier(
@@ -210,11 +300,6 @@ export async function fetchLevelValue(
   return result;
 }
 
-/**
- * Continuation fetch: the next `batchSize` items of the array at
- * `parentDotPath`, starting at `offset`, resolved to `depth` levels each,
- * plus a trailing truncation marker if more remain past this batch.
- */
 export async function fetchArrayBatch(
   filePath: string,
   parentDotPath: string,
@@ -222,10 +307,12 @@ export async function fetchArrayBatch(
   offset: number,
   batchSize = 10
 ): Promise<any[]> {
+  log("fetchArrayBatch", { filePath, parentDotPath, depth, offset, batchSize });
   const parentJpath = dotPathToJsonPath(parentDotPath);
   const [head] = await describeNodesBatch(filePath, [{ nodeId: 0, jpath: parentJpath }]);
   const len = head?.arrLen ?? 0;
   const end = Math.min(offset + batchSize, len);
+  log("fetchArrayBatch resolved length", len, "-> slicing", offset, "to", end);
 
   const arr: any[] = [];
   const slots: PendingSlot[] = [];
@@ -247,18 +334,13 @@ export async function fetchArrayBatch(
   return arr;
 }
 
-/**
- * Batch version of fetchLevelValue: resolves several independent dot-paths
- * (e.g. an entire frontier of TruncatedMarkers) `delta` levels deeper each,
- * in one shared BFS — so a wide frontier still costs exactly `delta` scans
- * total, not one scan per path.
- */
 export async function fetchMultipleLevelValues(
   filePath: string,
   dotPaths: string[],
   delta: number,
   childLimit = 10
 ): Promise<Record<string, any>> {
+  log("fetchMultipleLevelValues", { filePath, pathCount: dotPaths.length, delta, childLimit });
   const results: Record<string, any> = {};
   const slots: PendingSlot[] = dotPaths.map((dp) => ({
     jpath: dotPathToJsonPath(dp),

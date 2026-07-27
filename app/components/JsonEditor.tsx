@@ -41,7 +41,13 @@ export default function JsonEditor({
         </div>
 
         <div className="tree-wrapper" style={{ flex: 1, minWidth: 0, height: "100%" }}>
-          <JsonTreeView source={text} fileId={fileId ?? null} defaultExpandDepth={2} />
+          {fileId ? (
+            <JsonTreeView fileId={fileId} defaultExpandDepth={2} />
+          ) : (
+            <div className="jt-pane" style={{ display: "flex", flexDirection: "column", height: "100%", alignItems: "center", justifyContent: "center", color: "var(--jt-linenum, #6b7078)", fontSize: 13 }}>
+              Load a file to see the tree view
+            </div>
+          )}
         </div>
       </div>
     </div>
