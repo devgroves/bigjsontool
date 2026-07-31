@@ -375,22 +375,19 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Missing or invalid 'id'" }, { status: 400 });
   }
 
-  // ── Manifest-backed entry (Fastify) — checked first ────────────────────
+  // ── Manifest-backed entry (split_results/*.json behind Fastify) ──────
+  // Checked first: no disk file exists for these ids, and there's no
+  // byte-range index to build — master_manifest.json's chunk item_counts
+  // already give exact root array lengths, so depth=1 at "$" is free.
   const manifestEntry = getManifestEntry(id);
   if (manifestEntry) {
-    const startMs = Date.now();
-    console.log(`[json-level] manifest hit for ${id}, path=${jsonPath}, depth=${depth}, offset=${offset}`);
     try {
       const value = await resolveManifestValue(manifestEntry, jsonPath, depth, offset);
-      const elapsed = Date.now() - startMs;
-      console.log(`[json-level] manifest resolved in ${elapsed}ms, path=${jsonPath}`);
       if (value === undefined) {
         return NextResponse.json({ error: `Path '${jsonPath}' not found` }, { status: 404 });
       }
       return NextResponse.json({ path: jsonPath, depth, value });
     } catch (e: any) {
-      const elapsed = Date.now() - startMs;
-      console.warn(`[json-level] manifest query failed after ${elapsed}ms:`, e?.message);
       return NextResponse.json({ error: e.message ?? "Manifest query failed" }, { status: 500 });
     }
   }

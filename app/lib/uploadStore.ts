@@ -20,6 +20,10 @@ export function metaFilePath(id: string) {
   return path.join(UPLOAD_DIR, `${id}.meta.json`);
 }
 
+export function manifestFilePath(id: string) {
+  return dataPath(id).replace(".bin", ".manifest.json");
+}
+
 export interface FileMeta {
   name: string;
   size: number;
