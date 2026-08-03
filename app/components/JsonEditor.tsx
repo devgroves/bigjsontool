@@ -15,6 +15,10 @@ export default function JsonEditor({
   // initial `value` prop.
   const [text, setText] = useState(value);
 
+  // When true, the left text pane is hidden and the tree pane takes the full
+  // editor width.
+  const [treeFull, setTreeFull] = useState(false);
+
   // Keep in sync if the parent passes a new `value` externally (e.g. new
   // bytes arriving from the stream). In remote mode (fileId set), content
   // lives server-side and is fetched in windows by the child components —
@@ -28,20 +32,28 @@ export default function JsonEditor({
   return (
     <div className="editor-host" style={{ height: "100%" }}>
       <div className="editor-split" style={{ display: "flex", height: "100%" }}>
-        <div
-          className="textarea-wrapper"
-          style={{
-            flex: 1,
-            minWidth: 0,
-            height: "100%",
-            background: "var(--jt-editor-bg, #1e1e1e)",
-          }}
-        >
-          <VirtualTextArea value={text} onChange={setText} fileId={fileId} />
-        </div>
+        {!treeFull && (
+          <div
+            className="textarea-wrapper"
+            style={{
+              flex: 1,
+              minWidth: 0,
+              height: "100%",
+              background: "var(--jt-editor-bg, #1e1e1e)",
+            }}
+          >
+            <VirtualTextArea value={text} onChange={setText} fileId={fileId} />
+          </div>
+        )}
 
         <div className="tree-wrapper" style={{ flex: 1, minWidth: 0, height: "100%" }}>
-          <JsonTreeView source={text} fileId={fileId ?? null} defaultExpandDepth={2} />
+          <JsonTreeView
+            source={text}
+            fileId={fileId ?? null}
+            defaultExpandDepth={2}
+            fullWidth={treeFull}
+            onToggleFullWidth={() => setTreeFull((v) => !v)}
+          />
         </div>
       </div>
     </div>

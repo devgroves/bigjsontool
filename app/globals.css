@@ -298,11 +298,83 @@ body {
   cursor: pointer;
 }
 
-.jt-btn[data-active="true"] { background: var(--jt-accent, #3a5a8f); color: #fff; }
+.jt-btn[data-active="true"],
+.jt-btn[data-active="true"]:hover {
+  background: var(--jt-accent, #4a90d9);
+  color: #fff;
+  border-color: var(--jt-accent, #4a90d9);
+}
 .jt-chunk-row .jt-chunk-label { opacity: 0.75; font-style: italic; cursor: pointer; }
 
 .jt-btn:hover {
   background: #2a3142;
+}
+
+.jt-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* ── Query bar ─────────────────────────────────────────────────────────── */
+
+.jt-query-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 auto;
+  max-width: 460px;
+  margin: 0 12px;
+}
+
+.jt-query-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  padding: 4px 8px;
+  background: #1a1d27;
+  border: 1px solid #2a3142;
+  border-radius: 3px;
+  color: #d4d4d4;
+  font-family: Consolas, Menlo, Monaco, "Courier New", monospace;
+  font-size: 11px;
+  outline: none;
+}
+
+.jt-query-input::placeholder {
+  color: #5a6373;
+}
+
+.jt-query-input:focus {
+  border-color: var(--jt-accent, #4a90d9);
+}
+
+.jt-query-input:disabled {
+  opacity: 0.5;
+}
+
+.jt-btn-query {
+  background: var(--jt-accent, #4a90d9);
+  color: #fff;
+  border-color: var(--jt-accent, #4a90d9);
+  flex-shrink: 0;
+}
+
+.jt-btn-query:hover {
+  background: #3d7ec4;
+}
+
+.jt-btn-query:disabled {
+  opacity: 0.5;
+}
+
+.jt-btn-clear {
+  background: #5a2020;
+  color: #f0b0b0;
+  border-color: #7a3030;
+  flex-shrink: 0;
+}
+
+.jt-btn-clear:hover {
+  background: #6e2828;
 }
 
 .jt-body {

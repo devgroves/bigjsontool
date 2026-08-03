@@ -1,4 +1,5 @@
 import type { ManifestChunk, ManifestEntry } from "./manifestFileStore";
+import { fastifyGet, getKeyKind } from "./manifestFileStore";
 
 // Must match MAX_PREVIEW_SIZE in app/api/json-level/route.ts and
 // INDIVIDUAL_ITEM_THRESHOLD in JsonTreeView.tsx.
@@ -31,69 +32,34 @@ function truncateByDepth(value: any, depth: number): any {
   return out;
 }
 
-/** Which chunk + local (within-chunk) index holds global array index `idx`. */
+/** Which chunk + local (within-chunk) index holds global array index `idx`.
+ *  Prefers the json_path-derived ranges stamped at registration, falling back
+ *  to item_count accumulation for legacy manifests. */
 function locateChunk(
   chunkList: ManifestChunk[],
   idx: number,
 ): { chunk: ManifestChunk; localIndex: number } | null {
   let cursor = 0;
   for (const c of chunkList) {
-    if (idx < cursor + c.item_count) return { chunk: c, localIndex: idx - cursor };
-    cursor += c.item_count;
+    const start = c.start ?? cursor;
+    const end = c.end ?? cursor + (c.item_count ?? 0);
+    if (idx >= start && idx < end) return { chunk: c, localIndex: idx - start };
+    cursor = end;
   }
   return null;
 }
 
-/** GET {baseUrl}/{fileName}?...params, per the Fastify query API in README.md.
- *  ASSUMPTION (unverified — no sample Fastify response to check against):
- *  the endpoint returns the resolved value directly as the JSON body. If your
- *  server instead wraps it (e.g. { result: ... } or { value: ... }), adjust
- *  the unwrap line below — everything else is unaffected. */
-async function fastifyGet(
-  entry: ManifestEntry,
-  fileName: string,
-  params: Record<string, string | number>,
-): Promise<any> {
-  const url = new URL(`${entry.baseUrl.replace(/\/$/, "")}/${fileName}`);
-  for (const [k, v] of Object.entries(params)) url.searchParams.set(k, String(v));
-
-  const fastifyUrl = url.toString();
-  const startMs = Date.now();
-  console.log(`[manifestJsonValue] >>> fastifyGet: ${fastifyUrl}`);
-
-  let res: Response;
-  try {
-    res = await fetch(fastifyUrl);
-  } catch (err: any) {
-    const elapsed = Date.now() - startMs;
-    console.error(`[manifestJsonValue] <<< fastifyGet fetch error after ${elapsed}ms: ${fastifyUrl}`, err?.message);
-    throw err;
-  }
-
-  const elapsed = Date.now() - startMs;
-
-  if (!res.ok) {
-    const errorBody = await res.text().catch(() => "unable to read body");
-    console.warn(`[manifestJsonValue] <<< fastifyGet FAILED ${res.status} in ${elapsed}ms: ${fastifyUrl}`);
-    console.warn(`[manifestJsonValue] response body: ${errorBody}`);
-    throw new Error(`Fastify request failed (${res.status}): ${fastifyUrl}`);
-  }
-
-  const body = await res.json();
-  console.log(`[manifestJsonValue] <<< fastifyGet OK ${res.status} in ${elapsed}ms: ${fastifyUrl}`);
-  console.log(`[manifestJsonValue] response keys: ${typeof body === "object" ? Object.keys(body).join(", ") : typeof body}`);
-
-  // Unwrap common envelope shapes defensively; fall back to the raw body.
-  if (body && typeof body === "object" && !Array.isArray(body)) {
-    if ("result" in body) return body.result;
-    if ("value" in body) return body.value;
-  }
-  return body;
+/** Total item/key count for a root key across all its chunks. */
+function totalCount(entry: ManifestEntry, key: string): number {
+  const snap = entry.depth1Snapshot?.[key] as any;
+  if (snap && typeof snap === "object" && snap.__count__ != null) return snap.__count__;
+  return (entry.chunks?.[key] ?? []).reduce((s, c) => s + (c.item_count ?? 0), 0);
 }
 
 /** Fetch up to `count` items of root array `key` starting at global offset
  *  `start`, crossing chunk boundaries as needed. Uses Fastify's own
- *  skip/limit so we never pull a full chunk just to preview 10 items. */
+ *  skip/limit so we never pull a full chunk just to preview 10 items.
+ *  Array root keys only — callers dispatch on kind first. */
 async function sliceArray(
   entry: ManifestEntry,
   key: string,
@@ -107,9 +73,10 @@ async function sliceArray(
   let cursor = 0;
   for (const c of chunkList) {
     if (out.length >= count) break;
-    const chunkEnd = cursor + c.item_count;
+    const chunkStart = c.start ?? cursor;
+    const chunkEnd = c.end ?? cursor + (c.item_count ?? 0);
     if (start < chunkEnd) {
-      const localSkip = Math.max(0, start - cursor);
+      const localSkip = Math.max(0, start - chunkStart);
       const need = count - out.length;
       const page = await fastifyGet(entry, c.file_name, { path: key, skip: localSkip, limit: need });
       if (Array.isArray(page)) out.push(...page);
@@ -119,10 +86,60 @@ async function sliceArray(
   return out;
 }
 
+/** Merge every chunk of an object root key into a single object. Chunks may
+ *  hold disjoint key subsets (split objects: {"key": {…parts…}}), so we
+ *  Object.assign them together. Falls back to returning a scalar/array if a
+ *  chunk turns out not to be an object (kind mismatches). */
+async function mergedObject(entry: ManifestEntry, key: string): Promise<any> {
+  const chunkList = entry.chunks?.[key] ?? [];
+  const merged: Record<string, any> = {};
+  for (const c of chunkList) {
+    const part = await fastifyGet(entry, c.file_name, { path: key });
+    if (part && typeof part === "object" && !Array.isArray(part)) {
+      Object.assign(merged, part);
+    } else if (Array.isArray(part)) {
+      return part;
+    } else if (Object.keys(merged).length === 0) {
+      return part;
+    }
+  }
+  return merged;
+}
+
+/** Fetch a scalar root key's value from its single chunk. */
+async function scalarValue(entry: ManifestEntry, key: string): Promise<any> {
+  const chunk = entry.chunks?.[key]?.[0];
+  if (!chunk) return undefined;
+  return fastifyGet(entry, chunk.file_name, { path: key });
+}
+
+/** Build the depth-truncated subtree shown for root key `key` when expanding
+ *  the root view (path="$", depth>1). */
+async function buildRootChild(
+  entry: ManifestEntry,
+  key: string,
+  kind: "array" | "object" | "scalar",
+  depth: number,
+): Promise<any> {
+  if (kind === "scalar") return scalarValue(entry, key);
+  if (kind === "array") {
+    const items = await sliceArray(entry, key, 0, MAX_PREVIEW_SIZE);
+    const truncatedItems = items.map((it) => truncateByDepth(it, depth - 1));
+    const total = totalCount(entry, key);
+    if (total > truncatedItems.length) {
+      truncatedItems.push(truncatedMarker("array", total - truncatedItems.length));
+    }
+    return truncatedItems;
+  }
+  return truncateByDepth(await mergedObject(entry, key), depth - 1);
+}
+
 /** Root-level entry point, mirroring resolvePath()/extractFromFile() in
  *  route.ts: given a $-path, a render depth, and an array pagination offset,
  *  return the tree-node value (with truncation markers), or undefined if the
- *  path doesn't resolve. */
+ *  path doesn't resolve. Dispatch is kind-aware (array/object/scalar) based
+ *  on the manifest's value_type, so object root keys like `metadata` render
+ *  as objects instead of being mistaken for arrays. */
 export async function resolveManifestValue(
   entry: ManifestEntry,
   jsonPath: string,
@@ -133,17 +150,12 @@ export async function resolveManifestValue(
   if (jsonPath === "$" || jsonPath === "") {
     if (depth <= 1) return entry.depth1Snapshot;
 
-    // depth>1 at root: expand every key's first page in one go, same as the
-    // idxHasDepth1/root-expansion branch in route.ts.
+    // depth>1 at root: expand every key's first page in one go, dispatching
+    // each key by its container kind.
     const base: Record<string, any> = {};
     for (const key of Object.keys(entry.chunks)) {
-      const total = (entry.depth1Snapshot[key] as any).__count__ as number;
-      const items = await sliceArray(entry, key, 0, MAX_PREVIEW_SIZE);
-      const truncatedItems = items.map((it) => truncateByDepth(it, depth - 1));
-      if (total > items.length) {
-        truncatedItems.push(truncatedMarker("array", total - items.length));
-      }
-      base[key] = truncatedItems;
+      const kind = await getKeyKind(entry, key);
+      base[key] = await buildRootChild(entry, key, kind, depth);
     }
     return base;
   }
@@ -152,14 +164,18 @@ export async function resolveManifestValue(
   const topKey = segs[0];
   const chunkList = entry.chunks[topKey];
   if (!chunkList) return undefined;
+  const kind = await getKeyKind(entry, topKey);
 
-  // Path targets the root array itself ("$.users") — return a batch page
-  // starting at `offset`. This is what the "N items remaining" placeholder
-  // click hits (isBatch branch in JsonTreeView.tsx).
+  // Path targets the root value itself ("$.metadata", "$.users"). Arrays
+  // return a batch page starting at `offset` (what the "N items remaining"
+  // placeholder click hits); objects/scalars return their whole value.
   if (segs.length === 1) {
-    const total = (entry.depth1Snapshot[topKey] as any).__count__ as number;
+    if (kind === "scalar") return scalarValue(entry, topKey);
+    if (kind === "object") return truncateByDepth(await mergedObject(entry, topKey), depth);
+
     const items = await sliceArray(entry, topKey, offset, MAX_PREVIEW_SIZE);
     const truncatedItems = items.map((it) => truncateByDepth(it, depth - 1));
+    const total = totalCount(entry, topKey);
     const consumed = offset + items.length;
     if (total > consumed) {
       truncatedItems.push(truncatedMarker("array", total - consumed));
@@ -167,11 +183,12 @@ export async function resolveManifestValue(
     return truncatedItems;
   }
 
-  // Path targets one specific item, optionally a nested field within it
-  // ("$.users.1523" or "$.users.1523.address.city").
-  const idx = Number(segs[1]);
-  if (Number.isInteger(idx) && idx >= 0) {
-    // Numeric index — array item lookup via chunk pagination
+  // Path goes one (or more) levels under the root key.
+  if (kind === "array") {
+    // "users.1523" or "users.1523.address.city" — array item lookup via chunk pagination
+    const idx = Number(segs[1]);
+    if (!Number.isInteger(idx) || idx < 0) return undefined;
+
     const rest = segs.slice(2);
     const loc = locateChunk(chunkList, idx);
     if (!loc) return undefined;
@@ -185,13 +202,40 @@ export async function resolveManifestValue(
     return truncateByDepth(value, depth);
   }
 
-  // Non-numeric second segment — nested object key (e.g. "$.numeric_tables.matrices").
-  // Forward the full dot-path to Fastify and let it resolve the value.
-  const subPath = segs.join(".");
-  const chunk = chunkList[0];
-  if (!chunk) return undefined;
-
-  const value = await fastifyGet(entry, chunk.file_name, { path: subPath });
+  // Object root key (e.g. "metadata.configuration.export_settings") — resolve
+  // the nested path against the merged object locally.
+  const merged = await mergedObject(entry, topKey);
+  let value = merged;
+  for (const s of segs.slice(1)) {
+    if (value == null || typeof value !== "object") return undefined;
+    value = value[s];
+  }
   if (value === undefined) return undefined;
   return truncateByDepth(value, depth);
+}
+
+// ── Shared helpers reused by app/api/json-query/route.ts ────────────────────
+
+export async function getManifestKeyKind(
+  entry: ManifestEntry,
+  key: string,
+): Promise<"array" | "object" | "scalar"> {
+  return getKeyKind(entry, key);
+}
+
+export function getManifestArrayItems(
+  entry: ManifestEntry,
+  key: string,
+  start: number,
+  count: number,
+): Promise<any[]> {
+  return sliceArray(entry, key, start, count);
+}
+
+export function getManifestMergedObject(entry: ManifestEntry, key: string): Promise<any> {
+  return mergedObject(entry, key);
+}
+
+export function getManifestScalar(entry: ManifestEntry, key: string): Promise<any> {
+  return scalarValue(entry, key);
 }

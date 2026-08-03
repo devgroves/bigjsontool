@@ -58,6 +58,11 @@ interface JsonTreeViewProps {
   /** Arrays longer than this are grouped into expandable chunks, unless
    *  `ignoreLargeArray` is enabled. Default 100. */
   groupSize?: number;
+  /** When true, the tree pane occupies the full editor width (left text pane
+   *  hidden). Toggled by `onToggleFullWidth`. */
+  fullWidth?: boolean;
+  /** Callback to toggle full-width tree view. */
+  onToggleFullWidth?: () => void;
 }
 
 function isObject(v: unknown): v is Record<string, JsonValue> {
@@ -572,6 +577,8 @@ export default function JsonTreeView({
   defaultExpandDepth = 2,
   rowHeight = 22,
   groupSize = 100,
+  fullWidth = false,
+  onToggleFullWidth,
 }: JsonTreeViewProps) {
   // --- Local-parse mode (fileId not set): unchanged from before -----------
   const [debouncedSource, setDebouncedSource] = useState(source);
@@ -595,6 +602,12 @@ export default function JsonTreeView({
   const [serverLoading, setServerLoading] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
   const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
+
+  // --- JSONPath query mode --------------------------------------------------
+  const [queryInput, setQueryInput] = useState("");
+  const [queryLoading, setQueryLoading] = useState(false);
+  const [queryError, setQueryError] = useState<string | null>(null);
+  const [isQueryMode, setIsQueryMode] = useState(false);
 
   useEffect(() => {
     if (!fileId) {
@@ -639,7 +652,9 @@ export default function JsonTreeView({
     (jsonPath: string, parentJsonPath: string, offset: number) => {
       if (!fileId) return;
       setLoadingPaths((prev) => new Set(prev).add(jsonPath));
-      const phDepth = Math.min(presetToServerDepth(collapsed), 3);
+      // Floor at 2 so the user always sees at least one level of real data
+      // (depth=1 truncates children at depth-1=0, producing infinite markers).
+      const phDepth = Math.max(2, Math.min(presetToServerDepth(collapsed), 3));
 
       // Offsets below the threshold are individual items — fetch the specific
       // path and replace in place.  Offsets at or above the threshold are batch
@@ -675,6 +690,57 @@ export default function JsonTreeView({
     },
     [fileId, collapsed]
   );
+
+  // --- JSONPath query handlers ----------------------------------------------
+  const handleQuerySubmit = useCallback(async () => {
+    if (!fileId || !queryInput.trim()) return;
+    setQueryLoading(true);
+    setQueryError(null);
+    try {
+      const res = await fetch("/api/json-query", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          id: fileId,
+          query: queryInput.trim(),
+          depth: 2,
+          limit: 100,
+        }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body?.error || "Query failed");
+      setServerRoot(body.value);
+      setIsQueryMode(true);
+    } catch (e: any) {
+      setQueryError(e.message || "Query failed");
+    } finally {
+      setQueryLoading(false);
+    }
+  }, [fileId, queryInput]);
+
+  const handleClearQuery = useCallback(() => {
+    setQueryInput("");
+    setQueryError(null);
+    setIsQueryMode(false);
+    // Re-fetch the normal tree view at the current depth
+    if (fileId) {
+      setServerLoading(true);
+      setServerError(null);
+      const fetchDepth = Math.min(presetToServerDepth(collapsed), 3);
+      fetch(`/api/json-level?id=${encodeURIComponent(fileId)}&path=%24&depth=${fetchDepth}`)
+        .then(async (res) => {
+          const body = await res.json();
+          if (!res.ok) throw new Error(body?.error || `Request failed (${res.status})`);
+          setServerRoot(body.value);
+        })
+        .catch((e) => {
+          setServerError(e.message || "Failed to load JSON from server");
+        })
+        .finally(() => {
+          setServerLoading(false);
+        });
+    }
+  }, [fileId, collapsed]);
 
   const parsed = useMemo<{ ok: true; value: JsonValue | null } | { ok: false; error: string }>(() => {
     if (!fileId) return localParsed;
@@ -792,6 +858,41 @@ export default function JsonTreeView({
         <span className="jt-toolbar-title">
           Tree view{fileId ? " (server-fetched by level)" : ""}
         </span>
+
+        {/* JSONPath query bar — only shown when a file is loaded */}
+        {fileId && (
+          <div className="jt-query-bar">
+            <input
+              type="text"
+              className="jt-query-input"
+              value={queryInput}
+              onChange={(e: { target: { value: any } }) => setQueryInput(e.target.value)}
+              placeholder="JSONPath query, e.g. $.users[?(@.age>30)]"
+              onKeyDown={(e: { key: string }) => {
+                if (e.key === "Enter") handleQuerySubmit();
+              }}
+              disabled={queryLoading}
+            />
+            <button
+              type="button"
+              className="jt-btn jt-btn-query"
+              onClick={handleQuerySubmit}
+              disabled={queryLoading || !queryInput.trim()}
+            >
+              {queryLoading ? "Querying\u2026" : "Query"}
+            </button>
+            {isQueryMode && (
+              <button
+                type="button"
+                className="jt-btn jt-btn-clear"
+                onClick={handleClearQuery}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+        )}
+
         <div className="jt-toolbar-actions">
           {PRESETS.map((p) => (
             <button
@@ -799,6 +900,8 @@ export default function JsonTreeView({
               type="button"
               className="jt-btn"
               data-active={collapsed === p.value}
+              disabled={isQueryMode}
+              title={isQueryMode ? "Clear the search query to change depth" : undefined}
               onClick={() => setCollapsed(p.value)}
             >
               {p.label}
@@ -808,10 +911,23 @@ export default function JsonTreeView({
             type="button"
             className="jt-btn jt-btn-ignore"
             data-active={ignoreLargeArray}
+            disabled={isQueryMode}
+            title={isQueryMode ? "Clear the search query first" : undefined}
             onClick={() => setIgnoreLargeArray((v) => !v)}
           >
             ignoreLargeArray
           </button>
+          {onToggleFullWidth && (
+            <button
+              type="button"
+              className="jt-btn jt-btn-expand"
+              data-active={fullWidth}
+              title={fullWidth ? "Show text pane (split view)" : "Expand tree to full width"}
+              onClick={onToggleFullWidth}
+            >
+              {fullWidth ? "Split" : "Expand"}
+            </button>
+          )}
         </div>
       </div>
 
@@ -820,6 +936,12 @@ export default function JsonTreeView({
         ref={bodyRef}
         style={{ flex: 1, minHeight: 0, position: "relative" }}
       >
+        {queryError && (
+          <div className="jt-error" style={{ marginBottom: 8 }}>
+            <div className="jt-error-title">Query error</div>
+            <div className="jt-error-detail">{queryError}</div>
+          </div>
+        )}
         {!parsed.ok ? (
           <div className="jt-error">
             <div className="jt-error-title">Invalid JSON</div>
@@ -850,7 +972,7 @@ export default function JsonTreeView({
           </div>
         )}
 
-        {isLoading && parsed.ok && (
+        {(isLoading || queryLoading) && parsed.ok && (
           <div
             className="jt-loading-overlay"
             style={{
@@ -870,11 +992,13 @@ export default function JsonTreeView({
             <Spinner
               size={16}
               label={
-                isStreamingIn
-                  ? "Waiting for more data…"
+                queryLoading
+                  ? "Running JSONPath query\u2026"
+                  : isStreamingIn
+                  ? "Waiting for more data\u2026"
                   : fileId && serverLoading
-                  ? "Fetching level from server…"
-                  : "Preparing tree…"
+                  ? "Fetching level from server\u2026"
+                  : "Preparing tree\u2026"
               }
             />
           </div>
