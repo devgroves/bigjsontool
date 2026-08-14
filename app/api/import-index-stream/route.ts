@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { createReadStream, existsSync, statSync, writeFileSync } from "node:fs";
+import { createReadStream, existsSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { dataPath, isValidId, indexFilePath } from "../../lib/uploadStore";
 import { buildIndexFromStream } from "../../lib/buildIndex";
 import { getManifestEntry, registerManifestEntry } from "../../lib/manifestFileStore";
@@ -146,12 +146,54 @@ async function trySplitAndRegister(
 
 // ── Fallback: local byte-offset index (original behaviour) ─────────────────
 
+/** Minimal validity check, mirroring json-level/register-manifest. Rejects the
+ *  corrupted-index shape from the old inString bug so we never short-circuit
+ *  on a broken file. Array-root indexes (depth1 === null with a sound "$"
+ *  container) are accepted. */
+function isValidLocalIndex(idx: Record<string, any>): boolean {
+  if (!idx || typeof idx !== "object") return false;
+  if (idx.depth1 == null) {
+    const root = idx.containers?.["$"];
+    if (!root || typeof root !== "object") return false;
+    if (root.type !== "array") return false;
+    return root.offset != null && root.endOffset != null && root.endOffset >= root.offset;
+  }
+  if (typeof idx.depth1 !== "object") return false;
+  const hasMarker = Object.values(idx.depth1).some(
+    (v: any) => v && typeof v === "object" && v.__truncated__ != null,
+  );
+  if (hasMarker) return true;
+
+  const depth1Keys = Object.keys(idx.depth1);
+  if (depth1Keys.length === 0) return false;
+
+  const containerCount = idx.containers ? Object.keys(idx.containers).length : 0;
+  if (containerCount === 1 && !idx.rootKeys) return false;
+  if (containerCount > 1) return false;
+  return true;
+}
+
 async function buildLocalIndex(
   id: string,
   send: (event: string, data: unknown) => void,
 ): Promise<void> {
   const basePath = dataPath(id);
   const ip = indexFilePath(id);
+
+  // Short-circuit: if a usable local index already exists on disk, skip the
+  // full-file re-scan. Guards reconnects/retries after a previous or partial
+  // build (e.g. a streamed file that already built its index at write time).
+  if (existsSync(ip)) {
+    try {
+      const existing = JSON.parse(readFileSync(ip, "utf8"));
+      if (isValidLocalIndex(existing)) {
+        console.info(`[import-index-stream] reusing existing local index for id '${id}'`);
+        send("done", { depth1: existing.depth1 ?? null });
+        return;
+      }
+    } catch { /* fall through to rebuild */ }
+  }
+
   const totalBytes = statSync(basePath).size;
   let lastSent = 0;
   const SEND_EVERY = 2 * 1024 * 1024;

@@ -50,7 +50,7 @@ export default function JsonEditor({
           <JsonTreeView
             source={text}
             fileId={fileId ?? null}
-            defaultExpandDepth={2}
+            defaultExpandDepth={true}
             fullWidth={treeFull}
             onToggleFullWidth={() => setTreeFull((v) => !v)}
           />

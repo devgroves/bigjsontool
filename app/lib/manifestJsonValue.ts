@@ -5,8 +5,29 @@ import { fastifyGet, getKeyKind } from "./manifestFileStore";
 // INDIVIDUAL_ITEM_THRESHOLD in JsonTreeView.tsx.
 const MAX_PREVIEW_SIZE = 10;
 
-function truncatedMarker(kind: "object" | "array", count: number) {
-  return { __truncated__: true, __kind__: kind, __count__: count };
+/** Synthetic object key for "more keys remain" root-pagination markers.
+ *  Must match RESERVED_MARKER_KEY in app/api/json-level/route.ts. */
+const RESERVED_MARKER_KEY = "\u2026"; // "…"
+
+function truncatedMarker(kind: "object" | "array", count: number, offset?: number) {
+  const marker: Record<string, unknown> = { __truncated__: true, __kind__: kind, __count__: count };
+  if (offset != null) marker.__offset__ = offset;
+  return marker;
+}
+
+/** Page a resolved array honoring offset/limit, mirroring the streaming
+ *  parser's arrayOffset behavior in route.ts. Returns `value.slice(offset,
+ *  offset+limit)` with each item truncated by `depth-1`, plus a trailing
+ *  remainder marker when items remain. An offset past the end yields `[]`
+ *  (the client skips splicing empty pages). */
+function pageArray(value: any[], depth: number, offset: number, limit: number): any[] {
+  const page = value.slice(offset, offset + limit);
+  const items = page.map((it) => truncateByDepth(it, depth - 1));
+  const consumed = offset + page.length;
+  if (consumed < value.length) {
+    items.push(truncatedMarker("array", value.length - consumed));
+  }
+  return items;
 }
 
 /** Same truncation contract as the streaming parser in route.ts, just applied
@@ -58,7 +79,7 @@ function totalCount(entry: ManifestEntry, key: string): number {
 
 /** Fetch up to `count` items of root array `key` starting at global offset
  *  `start`, crossing chunk boundaries as needed. Uses Fastify's own
- *  skip/limit so we never pull a full chunk just to preview 10 items.
+ *  skip/limit so we never pull a full chunk just to preview a page.
  *  Array root keys only — callers dispatch on kind first. */
 async function sliceArray(
   entry: ManifestEntry,
@@ -78,7 +99,8 @@ async function sliceArray(
     if (start < chunkEnd) {
       const localSkip = Math.max(0, start - chunkStart);
       const need = count - out.length;
-      const page = await fastifyGet(entry, c.file_name, { path: key, skip: localSkip, limit: need });
+      const path = key === "$" ? "$[*]" : key;
+      const page = await fastifyGet(entry, c.file_name, { path, skip: localSkip, limit: need });
       if (Array.isArray(page)) out.push(...page);
     }
     cursor = chunkEnd;
@@ -120,10 +142,11 @@ async function buildRootChild(
   key: string,
   kind: "array" | "object" | "scalar",
   depth: number,
+  limit: number,
 ): Promise<any> {
   if (kind === "scalar") return scalarValue(entry, key);
   if (kind === "array") {
-    const items = await sliceArray(entry, key, 0, MAX_PREVIEW_SIZE);
+    const items = await sliceArray(entry, key, 0, limit);
     const truncatedItems = items.map((it) => truncateByDepth(it, depth - 1));
     const total = totalCount(entry, key);
     if (total > truncatedItems.length) {
@@ -145,27 +168,63 @@ export async function resolveManifestValue(
   jsonPath: string,
   depth: number,
   offset: number,
+  limit: number = MAX_PREVIEW_SIZE,
 ): Promise<any> {
   // Root.
   if (jsonPath === "$" || jsonPath === "") {
-    if (depth <= 1) return entry.depth1Snapshot;
+    // Single-chunk root-array manifests key their chunks under "$". The root
+    // value IS that array — present it as the top-level value (paged by
+    // offset/limit) so the tree never renders a synthetic "$" key around it
+    // and so root-array item pagination returns real items (offset is an
+    // array-item index here, not a root-key index). Named-key manifests keep
+    // the key-paging behavior below.
+    const rootKeys = Object.keys(entry.chunks ?? {});
+    const isRootArray = rootKeys.length === 1 && rootKeys[0] === "$";
+    if (isRootArray && depth > 1) {
+      const items = await sliceArray(entry, "$", offset, limit);
+      const truncatedItems = items.map((it) => truncateByDepth(it, depth - 1));
+      const total = totalCount(entry, "$");
+      const consumed = offset + items.length;
+      if (total > consumed) {
+        truncatedItems.push(truncatedMarker("array", total - consumed));
+      }
+      return truncatedItems;
+    }
+    if (depth <= 1) {
+      if (isRootArray) {
+        return entry.depth1Snapshot?.["$"] ?? truncatedMarker("array", totalCount(entry, "$"));
+      }
+      return entry.depth1Snapshot;
+    }
 
-    // depth>1 at root: expand every key's first page in one go, dispatching
-    // each key by its container kind.
+    // depth>1 at root: page over the root's immediate keys [offset, offset+limit),
+    // expanding each page key's first page. A trailing "…" marker carries the
+    // __offset__ so the client can fetch the next key page.
+    const keys = Object.keys(entry.chunks);
+    const pageKeys = keys.slice(offset, offset + limit);
     const base: Record<string, any> = {};
-    for (const key of Object.keys(entry.chunks)) {
+    for (const key of pageKeys) {
       const kind = await getKeyKind(entry, key);
-      base[key] = await buildRootChild(entry, key, kind, depth);
+      base[key] = await buildRootChild(entry, key, kind, depth, limit);
+    }
+    if (offset + pageKeys.length < keys.length) {
+      base[RESERVED_MARKER_KEY] = truncatedMarker(
+        "object",
+        keys.length - offset - pageKeys.length,
+        offset + pageKeys.length,
+      );
     }
     return base;
   }
 
+  console.info(`[json-level] resolveManifestValue called for ${jsonPath}, depth=${depth}, offset=${offset}, limit=${limit}`);
   const segs = jsonPath.replace(/^\$\.?/, "").split(".").filter(Boolean);
   const topKey = segs[0];
   const chunkList = entry.chunks[topKey];
   if (!chunkList) return undefined;
   const kind = await getKeyKind(entry, topKey);
 
+  console.info(`[json-level] resolveManifestValue topKey=${topKey}, kind=${kind}, segs=${segs.join(",")}`);
   // Path targets the root value itself ("$.metadata", "$.users"). Arrays
   // return a batch page starting at `offset` (what the "N items remaining"
   // placeholder click hits); objects/scalars return their whole value.
@@ -173,7 +232,7 @@ export async function resolveManifestValue(
     if (kind === "scalar") return scalarValue(entry, topKey);
     if (kind === "object") return truncateByDepth(await mergedObject(entry, topKey), depth);
 
-    const items = await sliceArray(entry, topKey, offset, MAX_PREVIEW_SIZE);
+    const items = await sliceArray(entry, topKey, offset, limit);
     const truncatedItems = items.map((it) => truncateByDepth(it, depth - 1));
     const total = totalCount(entry, topKey);
     const consumed = offset + items.length;
@@ -182,7 +241,7 @@ export async function resolveManifestValue(
     }
     return truncatedItems;
   }
-
+  console.info(`[json-level] resolveManifestValue path=${jsonPath} is a child of ${topKey}, kind=${kind}, segs=${segs.join(",")}`);
   // Path goes one (or more) levels under the root key.
   if (kind === "array") {
     // "users.1523" or "users.1523.address.city" — array item lookup via chunk pagination
@@ -199,11 +258,14 @@ export async function resolveManifestValue(
 
     const value = await fastifyGet(entry, loc.chunk.file_name, { path: subPath });
     if (value === undefined) return undefined;
-    return truncateByDepth(value, depth);
+    return Array.isArray(value)
+      ? pageArray(value, depth, offset, limit)
+      : truncateByDepth(value, depth);
   }
 
   // Object root key (e.g. "metadata.configuration.export_settings") — resolve
-  // the nested path against the merged object locally.
+  // the nested path against the merged object locally. Arrays reached here
+  // are paged with offset/limit; anything else is truncated by depth.
   const merged = await mergedObject(entry, topKey);
   let value = merged;
   for (const s of segs.slice(1)) {
@@ -211,7 +273,9 @@ export async function resolveManifestValue(
     value = value[s];
   }
   if (value === undefined) return undefined;
-  return truncateByDepth(value, depth);
+  return Array.isArray(value)
+    ? pageArray(value, depth, offset, limit)
+    : truncateByDepth(value, depth);
 }
 
 // ── Shared helpers reused by app/api/json-query/route.ts ────────────────────

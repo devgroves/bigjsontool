@@ -1,9 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { randomUUID } from "node:crypto";
 import { writeFile } from "node:fs/promises";
-import { writeFileSync } from "node:fs";
-import { ensureUploadDir, dataPath, writeMeta, indexFilePath } from "../../lib/uploadStore";
-import { buildIndex } from "../../lib/buildIndex";
+import { ensureUploadDir, dataPath, writeMeta } from "../../lib/uploadStore";
 
 export const dynamic = "force-dynamic";
 
@@ -59,18 +57,14 @@ export async function POST(req: NextRequest) {
   });
   console.info("Saved upload", id, dp, file.name, buf.length, lineCount);
 
-  // Build index at upload time so first json-level request is instant.
-  try {
-    const index = buildIndex(buf);
-    console.info("Built index for upload", id, indexFilePath(id), index);
-    writeFileSync(indexFilePath(id), JSON.stringify(index));
-  } catch (error) {
-    // Index is a performance optimization — non-critical.
-    console.error("Failed to build index for upload", id, file.name, error);
-    if (error instanceof Error) {
-      console.error(error.stack);
-    }
-  }
+  // NOTE: index building used to happen synchronously right here
+  // (buildIndex(buf) + writeFileSync of indexFilePath(id)). For large files
+  // that single-request scan was slow enough to trip gateway/proxy timeouts
+  // on THIS response. It's now a separate step — the client calls
+  // GET /api/import-index-stream (SSE) with this id right after receiving
+  // the response below, and that route splits via pyjson-splitter by default
+  // (falling back to a local byte-offset index build) while streaming
+  // progress back. This matches the remote-URL import flow.
 
   return NextResponse.json({ id, name: file.name, size: buf.length, lineCount });
 }

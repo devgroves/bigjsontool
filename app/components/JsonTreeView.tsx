@@ -21,11 +21,15 @@ type JsonValue =
 
 /** Server-sent stand-in for a container whose contents weren't sent yet.
  *  Field names are deliberately unusual so they can't collide with real
- *  JSON data. See app/api/json-level/route.ts for the producing side. */
+ *  JSON data. See app/api/json-level/route.ts for the producing side.
+ *  `__offset__` is set on object remainder markers so the client can
+ *  paginate ("fetch the next N keys") instead of treating them as a
+ *  one-shot container expand. */
 interface TruncatedMarker {
   __truncated__: true;
   __kind__: "object" | "array";
   __count__: number;
+  __offset__?: number;
 }
 
 function isTruncatedMarker(v: JsonValue): v is TruncatedMarker & JsonValue {
@@ -36,6 +40,24 @@ function isTruncatedMarker(v: JsonValue): v is TruncatedMarker & JsonValue {
     (v as Record<string, unknown>).__truncated__ === true
   );
 }
+
+/** Synthetic object key used by the server for "more keys remain" markers
+ *  (pagination). The client detects markers by VALUE shape, so this key
+ *  only needs to not collide with real data — "…" is safe enough. Must match
+ *  RESERVED_MARKER_KEY in app/api/json-level/route.ts. */
+const RESERVED_MARKER_KEY = "\u2026";
+
+/** Server fast-path depth for the initial root fetch. Deeper levels are
+ *  reachable via expand-on-demand placeholders, which keeps a huge file
+ *  from ever being materialized in one response. Configurable via
+ *  NEXT_PUBLIC_TREE_MAX_DEPTH (clamped to the server's 12-level cap). */
+const MAX_ROOT_DEPTH = Math.min(
+  Number(process.env.NEXT_PUBLIC_TREE_MAX_DEPTH) || 6,
+  12,
+);
+/** Batch size used for scroll-continuation fetches (bigger than the default
+ *  10-item preview so scrolling doesn't hammer the server). */
+const CONTINUATION_PAGE = 200;
 
 /** Mirrors the common `collapsed` prop shape: depth number, true/false, or
  *  a custom per-node predicate ("function" mode). */
@@ -51,8 +73,10 @@ interface JsonTreeViewProps {
    *  demand. This is what makes huge imported/streamed files cheap to
    *  browse — the browser never holds or walks the full parsed object. */
   fileId?: string | null;
-  /** Collapse object/array nodes deeper than this on first render. Default 2. */
-  defaultExpandDepth?: number;
+  /** Collapse object/array nodes deeper than this on first render
+   *  (number = depth, `true` = deep server fetch, `false` = root keys only).
+   *  Default true. */
+  defaultExpandDepth?: CollapsedSetting;
   /** Row height in px, used by the virtualized list. Default 22. */
   rowHeight?: number;
   /** Arrays longer than this are grouped into expandable chunks, unless
@@ -159,6 +183,10 @@ type Row =
       jsonPath: string;
       parentJsonPath: string;
       offset: number;
+      /** True when the marker carried an explicit __offset__ (object/root
+       *  remainder) — must always be fetched as a batch, even when the offset
+       *  is below the array-item batch threshold. */
+      paged: boolean;
       key: string | null;
       depth: number;
       isLast: boolean;
@@ -183,8 +211,8 @@ function isDefaultExpanded(
   ctx: FlattenCtx
 ): boolean {
   const { collapsed } = ctx;
-  if (collapsed === true) return false;
-  if (collapsed === false) return true;
+  if (collapsed === true) return true;
+  if (collapsed === false) return false;
   if (collapsed === "function") return !defaultCollapseFn(key, value);
   return depth < collapsed;
 }
@@ -201,18 +229,25 @@ function flatten(
 ) {
   if (isTruncatedMarker(value)) {
     const marker = value as unknown as TruncatedMarker;
-    // For array placeholders, derive the parent array path and item offset
-    // so we can paginate (load next batch from server on click).
+    // Object/root remainder markers carry an explicit __offset__ so we can
+    // paginate ("fetch the next N keys"). For array item placeholders derive
+    // the parent array path and item offset from the numeric path segment.
     const lastSeg = jsonPath.split('.').pop()!;
     const isArrayItem = /^\d+$/.test(lastSeg) && jsonPath.includes('.');
-    const parentJsonPath = isArrayItem ? jsonPath.substring(0, jsonPath.lastIndexOf('.')) : jsonPath;
-    const itemOffset = isArrayItem ? Number(lastSeg) : 0;
+    const hasOffset = typeof marker.__offset__ === "number" && marker.__offset__ > 0;
+    const parentJsonPath = hasOffset
+      ? (jsonPath.substring(0, jsonPath.lastIndexOf('.')) || "$")
+      : isArrayItem
+      ? jsonPath.substring(0, jsonPath.lastIndexOf('.'))
+      : jsonPath;
+    const itemOffset = hasOffset ? (marker.__offset__ as number) : isArrayItem ? Number(lastSeg) : 0;
     out.push({
       kind: "placeholder",
       path,
       jsonPath,
       parentJsonPath,
       offset: itemOffset,
+      paged: hasOffset,
       key,
       depth,
       isLast,
@@ -347,6 +382,39 @@ function extendArrayAtPath(root: JsonValue, jsonPath: string, newItems: JsonValu
   return recur(root, 0);
 }
 
+/** Merges a page of object keys (from an offset-based batch fetch) into the
+ *  object at `jsonPath`, replacing the previous remainder marker with the
+ *  page's keys (and any new remainder marker the page itself carries). */
+function mergeObjectAtPath(
+  root: JsonValue,
+  jsonPath: string,
+  page: Record<string, JsonValue>,
+): JsonValue {
+  const segments = jsonPath.replace(/^\$\.?/, "").split(".").filter(Boolean);
+  function recur(node: JsonValue, idx: number): JsonValue {
+    if (idx === segments.length) {
+      const next: Record<string, JsonValue> = isObject(node) ? { ...node } : {};
+      delete next[RESERVED_MARKER_KEY];
+      for (const [k, v] of Object.entries(page)) next[k] = v;
+      return next;
+    }
+    const seg = segments[idx];
+    if (Array.isArray(node)) {
+      const i = Number(seg);
+      const copy = node.slice();
+      copy[i] = recur(copy[i], idx + 1);
+      return copy;
+    }
+    if (isObject(node)) {
+      const copy = { ...node };
+      copy[seg] = recur(copy[seg], idx + 1);
+      return copy;
+    }
+    return node;
+  }
+  return recur(root, 0);
+}
+
 /** Immutably replaces the value at `jsonPath` inside `root` — used to splice
  *  a freshly-fetched subtree back into the tree after expanding a
  *  server-truncated node. */
@@ -407,7 +475,7 @@ const RowRenderer = memo(function RowRenderer({
   height: number;
   toggleNode: (path: string, current: boolean) => void;
   toggleChunk: (path: string) => void;
-  loadPlaceholder: (jsonPath: string, parentJsonPath: string, offset: number) => void;
+  loadPlaceholder: (jsonPath: string, parentJsonPath: string, offset: number, paged: boolean) => void;
 }) {
   const indent = 10 + row.depth * 14;
   const style: React.CSSProperties = {
@@ -457,11 +525,11 @@ const RowRenderer = memo(function RowRenderer({
         {row.key !== null && <span className="jt-key">{row.key}</span>}
         {row.key !== null && <span className="jt-colon">:</span>}
         <span className="jt-bracket">{bracketOpen}</span>
-        <span
-          className="jt-collapsed-summary"
-          onClick={() => !row.loading && loadPlaceholder(row.jsonPath, row.parentJsonPath, row.offset)}
-          style={{ cursor: row.loading ? "default" : "pointer" }}
-        >
+          <span
+            className="jt-collapsed-summary"
+            onClick={() => !row.loading && loadPlaceholder(row.jsonPath, row.parentJsonPath, row.offset, row.paged)}
+            style={{ cursor: row.loading ? "default" : "pointer" }}
+          >
           {row.loading
             ? "loading…"
             : `${row.size} item${row.size === 1 ? "" : "s"} — click to load from server`}
@@ -559,7 +627,6 @@ const PRESETS: { label: string; value: CollapsedSetting }[] = [
   { label: "3", value: 3 },
   { label: "true", value: true },
   { label: "false", value: false },
-  { label: "function", value: "function" },
 ];
 
 function parseJson(source: string): { ok: true; value: JsonValue | null } | { ok: false; error: string } {
@@ -574,7 +641,7 @@ function parseJson(source: string): { ok: true; value: JsonValue | null } | { ok
 export default function JsonTreeView({
   source,
   fileId = null,
-  defaultExpandDepth = 2,
+  defaultExpandDepth = true,
   rowHeight = 22,
   groupSize = 100,
   fullWidth = false,
@@ -589,6 +656,7 @@ export default function JsonTreeView({
   const localParsed = useMemo(() => parseJson(debouncedSource), [debouncedSource]);
 
   const [collapsed, setCollapsed] = useState<CollapsedSetting>(defaultExpandDepth);
+  const [depthInput, setDepthInput] = useState("");
   const [ignoreLargeArray, setIgnoreLargeArray] = useState(false);
   const [expandedOverrides, setExpandedOverrides] = useState<Map<string, boolean>>(
     new Map()
@@ -602,12 +670,25 @@ export default function JsonTreeView({
   const [serverLoading, setServerLoading] = useState(false);
   const [serverError, setServerError] = useState<string | null>(null);
   const [loadingPaths, setLoadingPaths] = useState<Set<string>>(new Set());
+  /** Placeholders whose last fetch failed (e.g. a 404). The scroll-to-load
+   *  effect skips these so a bad path isn't re-fetched on every re-render
+   *  (the source of the flicker/request storm); a manual click still retries. */
+  const [failedPaths, setFailedPaths] = useState<Set<string>>(new Set());
 
   // --- JSONPath query mode --------------------------------------------------
   const [queryInput, setQueryInput] = useState("");
   const [queryLoading, setQueryLoading] = useState(false);
   const [queryError, setQueryError] = useState<string | null>(null);
   const [isQueryMode, setIsQueryMode] = useState(false);
+
+  // A new file (or no file) must not inherit query state from the previous one —
+  // the component stays mounted across imports, so stale isQueryMode/queryInput
+  // would otherwise lock the depth presets and show a stale Clear button.
+  useEffect(() => {
+    setQueryInput("");
+    setIsQueryMode(false);
+    setQueryError(null);
+  }, [fileId]);
 
   useEffect(() => {
     if (!fileId) {
@@ -620,10 +701,10 @@ export default function JsonTreeView({
     setServerError(null);
 
     // Fetch at the depth matching the current collapse preset.  The server
-    // fast-path (byte-offset seeking / rootKeys expansion) can serve
-    // depths 2-3 without a full file scan.  Capped at 3 so even the
-    // "true"/"function" presets don't trigger an overly deep response.
-    const fetchDepth = Math.min(presetToServerDepth(collapsed), 3);
+    // fast-path (byte-offset seeking / rootKeys expansion) can serve shallow
+    // depths without a full file scan; per-level truncation + pagination
+    // keeps deeper depths bounded too.
+    const fetchDepth = Math.min(presetToServerDepth(collapsed), MAX_ROOT_DEPTH);
     fetch(`/api/json-level?id=${encodeURIComponent(fileId)}&path=%24&depth=${fetchDepth}`)
       .then(async (res) => {
         const body = await res.json();
@@ -649,19 +730,34 @@ export default function JsonTreeView({
   const INDIVIDUAL_ITEM_THRESHOLD = 10;
 
   const loadPlaceholder = useCallback(
-    (jsonPath: string, parentJsonPath: string, offset: number) => {
+    (jsonPath: string, parentJsonPath: string, offset: number, paged: boolean) => {
       if (!fileId) return;
       setLoadingPaths((prev) => new Set(prev).add(jsonPath));
+      setFailedPaths((prev) => {
+        if (!prev.has(jsonPath)) return prev;
+        const next = new Set(prev);
+        next.delete(jsonPath);
+        return next;
+      });
       // Floor at 2 so the user always sees at least one level of real data
       // (depth=1 truncates children at depth-1=0, producing infinite markers).
-      const phDepth = Math.max(2, Math.min(presetToServerDepth(collapsed), 3));
+      const phDepth = Math.max(2, Math.min(presetToServerDepth(collapsed), MAX_ROOT_DEPTH));
+      // Paginating the root itself ("…" marker) must keep the SAME depth as
+      // the current root view — e.g. the `false` preset's depth-1 key list
+      // must not silently jump to a deeper expansion.
+      const batchDepth =
+        parentJsonPath === "$"
+          ? Math.max(1, Math.min(presetToServerDepth(collapsed), MAX_ROOT_DEPTH))
+          : phDepth;
 
-      // Offsets below the threshold are individual items — fetch the specific
-      // path and replace in place.  Offsets at or above the threshold are batch
-      // markers — fetch from the parent with offset and splice in the results.
-      const isBatch = offset >= INDIVIDUAL_ITEM_THRESHOLD && offset > 0;
+      // Markers carrying an explicit __offset__ (object/root remainders) are
+      // always batch fetches. Array item markers derive their offset from the
+      // numeric path segment; offsets at or above the threshold are batches,
+      // below it they're individual container stand-ins. Batches use a bigger
+      // page size so scrolling doesn't fire a request every 10 rows.
+      const isBatch = paged || (offset >= INDIVIDUAL_ITEM_THRESHOLD && offset > 0);
       const url = isBatch
-        ? `/api/json-level?id=${encodeURIComponent(fileId)}&path=${encodeURIComponent(parentJsonPath)}&depth=${phDepth}&offset=${offset}`
+        ? `/api/json-level?id=${encodeURIComponent(fileId)}&path=${encodeURIComponent(parentJsonPath)}&depth=${batchDepth}&offset=${offset}&limit=${CONTINUATION_PAGE}`
         : `/api/json-level?id=${encodeURIComponent(fileId)}&path=${encodeURIComponent(jsonPath)}&depth=${phDepth}`;
 
       fetch(url)
@@ -672,13 +768,21 @@ export default function JsonTreeView({
           setServerRoot((prev) => {
             if (prev == null) return prev;
             if (isBatch && Array.isArray(body.value)) {
+              // Empty page (offset past the end) — leave the tree untouched
+              // rather than truncating the array via a no-op splice.
+              if (body.value.length === 0) return prev;
               return extendArrayAtPath(prev, parentJsonPath, body.value as JsonValue[], offset);
+            }
+            if (isBatch && isObject(body.value)) {
+              return mergeObjectAtPath(prev, parentJsonPath, body.value as Record<string, JsonValue>);
             }
             return setAtJsonPath(prev, jsonPath, body.value);
           });
         })
         .catch(() => {
-          // Best-effort: leave the placeholder in place so the user can retry.
+          // Best-effort: leave the placeholder in place so the user can retry,
+          // but mark it failed so auto-scroll doesn't immediately re-fire it.
+          setFailedPaths((prev) => new Set(prev).add(jsonPath));
         })
         .finally(() => {
           setLoadingPaths((prev) => {
@@ -726,7 +830,7 @@ export default function JsonTreeView({
     if (fileId) {
       setServerLoading(true);
       setServerError(null);
-      const fetchDepth = Math.min(presetToServerDepth(collapsed), 3);
+      const fetchDepth = Math.min(presetToServerDepth(collapsed), MAX_ROOT_DEPTH);
       fetch(`/api/json-level?id=${encodeURIComponent(fileId)}&path=%24&depth=${fetchDepth}`)
         .then(async (res) => {
           const body = await res.json();
@@ -852,11 +956,31 @@ export default function JsonTreeView({
 
   const visibleRows = rows.slice(startIndex, endIndex);
 
+  // Scroll-to-load: as soon as a pagination (batch) placeholder row scrolls
+  // into view (± overscan), fetch its continuation automatically — remaining
+  // array items, remaining object keys, or remaining root keys. Individual
+  // container placeholders (offset below the threshold) stay click-to-expand;
+  // `row.loading` guards against concurrent duplicate fetches.
+  useEffect(() => {
+    if (!fileId || isLoading) return;
+    const id = setTimeout(() => {
+      for (const row of visibleRows) {
+        if (row.kind !== "placeholder") continue;
+        if (row.loading) continue;
+        if (failedPaths.has(row.jsonPath)) continue;
+        const isBatch = row.paged || (row.offset >= INDIVIDUAL_ITEM_THRESHOLD && row.offset > 0);
+        if (!isBatch) continue;
+        loadPlaceholder(row.jsonPath, row.parentJsonPath, row.offset, row.paged);
+      }
+    }, 120);
+    return () => clearTimeout(id);
+  }, [visibleRows, isLoading, fileId, loadPlaceholder, failedPaths]);
+
   return (
     <div className="jt-pane" style={{ display: "flex", flexDirection: "column", height: "100%" }}>
       <div className="jt-toolbar">
         <span className="jt-toolbar-title">
-          Tree view{fileId ? " (server-fetched by level)" : ""}
+          Tree view
         </span>
 
         {/* JSONPath query bar — only shown when a file is loaded */}
@@ -881,7 +1005,7 @@ export default function JsonTreeView({
             >
               {queryLoading ? "Querying\u2026" : "Query"}
             </button>
-            {isQueryMode && (
+            {(isQueryMode || queryError) && (
               <button
                 type="button"
                 className="jt-btn jt-btn-clear"
@@ -902,21 +1026,35 @@ export default function JsonTreeView({
               data-active={collapsed === p.value}
               disabled={isQueryMode}
               title={isQueryMode ? "Clear the search query to change depth" : undefined}
-              onClick={() => setCollapsed(p.value)}
+              onClick={() => {
+                setCollapsed(p.value);
+                setDepthInput("");
+              }}
             >
               {p.label}
             </button>
           ))}
-          <button
-            type="button"
-            className="jt-btn jt-btn-ignore"
-            data-active={ignoreLargeArray}
+          <input
+            type="number"
+            min={1}
+            max={12}
+            className="jt-btn jt-depth-input"
+            value={depthInput}
+            placeholder="depth"
             disabled={isQueryMode}
-            title={isQueryMode ? "Clear the search query first" : undefined}
-            onClick={() => setIgnoreLargeArray((v) => !v)}
-          >
-            ignoreLargeArray
-          </button>
+            title={isQueryMode ? "Clear the search query first" : "Go to a specific level"}
+            onChange={(e: { target: { value: string } }) => setDepthInput(e.target.value)}
+            onKeyDown={(e: { key: string; currentTarget: { value: string } }) => {
+              if (e.key !== "Enter") return;
+              const n = Number(e.currentTarget.value);
+              if (Number.isFinite(n) && n >= 0) setCollapsed(n);
+            }}
+            onBlur={(e: { target: { value: string } }) => {
+              const n = Number(e.target.value);
+              if (e.target.value !== "" && Number.isFinite(n) && n >= 0) setCollapsed(n);
+            }}
+          />
+          
           {onToggleFullWidth && (
             <button
               type="button"
@@ -966,8 +1104,7 @@ export default function JsonTreeView({
                   toggleNode={toggleNode}
                   toggleChunk={toggleChunk}
                   loadPlaceholder={loadPlaceholder}
-                />
-              ))}
+                />              ))}
             </div>
           </div>
         )}

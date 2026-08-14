@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { readFileSync, writeFileSync, existsSync, createReadStream } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, createReadStream, statSync } from "node:fs";
 import { Readable } from "node:stream";
 import { parserStream } from "stream-json";
 import { dataPath, isValidId, indexFilePath } from "../../lib/uploadStore";
@@ -25,13 +25,102 @@ function jsonpath(query: string, data: any): any[] {
     const mod = require("jsonpath-plus");
     _JSONPath = mod.JSONPath ?? mod.default?.JSONPath ?? mod;
   }
-  return _JSONPath!({ path: query, json: data, wrap: false });
+  return _JSONPath!({ path: normalizeFilterQuery(query), json: data, wrap: false });
+}
+
+/** jsonpath-plus with an array wrapper so a filter/match result is never
+ *  ambiguous: returns `[]` when nothing matched and `[value]` when it did
+ *  (with `wrap: false` a single match collapses to a bare value, which is
+ *  indistinguishable from "no match" when the matched element is itself
+ *  null/0/false). Used by the streaming selector scan. */
+function jsonpathMatch(query: string, data: any): any[] {
+  if (!_JSONPath) {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const mod = require("jsonpath-plus");
+    _JSONPath = mod.JSONPath ?? mod.default?.JSONPath ?? mod;
+  }
+  const m = _JSONPath!({ path: normalizeFilterQuery(query), json: data, wrap: true });
+  return Array.isArray(m) ? m : m != null ? [m] : [];
+}
+
+/** Marker tag on the value returned by parseJsonStream when it ran a
+ *  streaming selector scan — lets callers distinguish the
+ *  `{ results, total }` scan result from a plain parsed container. */
+const SELECTOR_RESULT = Symbol("selectorResult");
+
+function isSelectorResult(v: any): v is { results: any[]; total: number } {
+  return !!v && typeof v === "object" && v[SELECTOR_RESULT] === true;
+}
+
+/** jsonpath-plus v10 has no `=~`/`!~` regex operator and no Jayway `contains`
+ *  operator in filter expressions — both throw at parse time. Rewrite them to
+ *  equivalent function calls the SafeScript evaluator accepts before the query
+ *  is parsed, so RFC 9535-style `@.name =~ /NIFTY/` and Jayway-style
+ *  `@.name contains 'NIFTY'` work like `@.name.includes('NIFTY')`. Also absorb
+ *  the common dot-call typos `@.name.include('...')` and
+ *  `@.name.contains('...')` into `.includes(...)`. */
+function normalizeFilterQuery(query: string): string {
+  // @.field =~ /regex/flags  ->  @.field.match(/regex/flags)
+  // @.field !~ /regex/flags  ->  !@.field.match(/regex/flags)
+  // @.field contains 's'     ->  @.field.includes('s')
+  // @.field not contains 's' ->  !@.field.includes('s')
+  // @.field.include('s')     ->  @.field.includes('s')
+  // @.field.contains('s')    ->  @.field.includes('s')
+  return query
+    // Jayway filter typo `$[?{expr}]` silently evaluates to *nothing* in
+    // jsonpath-plus (no error, just no matches) — rewrite to the supported
+    // `$[?(expr)]` form.
+    .replace(/\[\?\{(.*?)\}\]/g, "[?($1)]")
+    // A dot directly before an index bracket (`$.[0:9]`, `$.items.[0:3]`) is
+    // tolerated by jsonpath-plus itself but breaks our own `remaining`/root-key
+    // parsing (selectors are expected to start with `[`). Strip structural dots
+    // only when immediately followed by `[`, leaving `@.x[0]` inside filter
+    // bodies and `..` recursive descent untouched.
+    .replace(/(?<=[\w$\]])\.(?=\[)/g, "")
+    .replace(
+      /(@\.[\w$[\].]+)\s*(!~|=~)\s*(\/(?:[^/\\\n]|\\.)*\/[a-z]*)/g,
+      (_m, target: string, op: string, regex: string) =>
+        `${op === "!~" ? "!" : ""}${target}.match(${regex})`,
+    )
+    .replace(
+      /(@\.[\w$[\].]+)\s*(not\s+contains|contains)\s+('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")/g,
+      (_m, target: string, op: string, literal: string) =>
+        `${op === "not contains" ? "!" : ""}${target}.includes(${literal})`,
+    )
+    .replace(
+      /(@\.[\w$[\].]+)\.(?:include|contains)\s*\(('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\)/g,
+      (_m, target: string, literal: string) =>
+        `${target}.includes(${literal})`,
+    );
+}
+
+/** Value used to validate a query without executing its filter predicates
+ *  against real-looking data. jsonpath-plus evaluates `[?(...)]` per item, so
+ *  a plain-object placeholder runs the predicate against scalar values and
+ *  throws on any property method call (e.g. `@.name.includes('NIFTY')` with
+ *  `@.name` undefined) — falsely rejecting valid queries. This Proxy answers
+ *  every property access with a callable that coerces to 0, so genuine syntax
+ *  errors still throw while valid predicates pass. */
+function validationSink(): any {
+  return new Proxy(function () {}, {
+    get: (_t: unknown, prop: string | symbol) => {
+      if (prop === Symbol.toPrimitive) return () => 0;
+      if (prop === "valueOf") return () => 0;
+      if (prop === "toString") return () => "";
+      return validationSink();
+    },
+    apply: () => validationSink(),
+  });
 }
 
 // ── Root-key extraction ────────────────────────────────────────────────────
 
 function extractRootKey(query: string): { rootKey: string; remaining: string } {
-  const stripped = query.replace(/^\$\.?/, "");
+  const stripped = query.replace(/^\$(\.(?!\.))?/, "");
+  // No leading field name (root-level expression): "$[?(...)]", "$[n:m]", "$[*]",
+  // "$..name", "$.name" where the root itself is an array. The whole expression
+  // targets the root value, so rootKey stays "" and everything is "remaining".
+  if (!stripped || /^[[.]/.test(stripped)) return { rootKey: "", remaining: stripped };
   const match = stripped.match(/^([a-zA-Z_][a-zA-Z0-9_]*)(.*)/);
   if (!match) return { rootKey: stripped, remaining: "" };
   return { rootKey: match[1], remaining: match[2] };
@@ -90,6 +179,12 @@ function truncatedMarker(kind: "object" | "array", count: number) {
 
 const MAX_PREVIEW_SIZE = 10;
 
+/** Largest container (in bytes) a local fallback query will fully materialize
+ *  in memory so filter/projection expressions can scan past the 10-item
+ *  preview. Larger containers keep the preview cap (avoids OOM on a
+ *  manifest-less multi-GB file). */
+const SAFE_QUERY_SCAN_BYTES = Number(process.env.SAFE_QUERY_SCAN_BYTES) || 256 * 1024 * 1024;
+
 type FrameMode = "build" | "skip" | "nav";
 
 interface Frame {
@@ -102,6 +197,16 @@ interface Frame {
   target: string | null;
   navRest: string[];
   navIndex: number;
+  /** True when this frame is the root array container being scanned with a
+   *  per-element selector (`selector` parse param) — each completed element is
+   *  evaluated individually instead of being built into a result array. */
+  selScan: boolean;
+  /** 0-based element index within the scanned array. */
+  selIndex: number;
+  /** Total number of selector matches seen so far (drives pagination). */
+  selTotal: number;
+  /** Collected selector matches, capped at selectorOffset + selectorLimit. */
+  selResults: any[];
 }
 
 function parseJsonStream(
@@ -109,6 +214,10 @@ function parseJsonStream(
   jsonPath: string,
   depth: number,
   knownCount?: number,
+  previewSize: number = MAX_PREVIEW_SIZE,
+  selector?: string,
+  selectorOffset = 0,
+  selectorLimit = 100,
 ): Promise<any> {
   return new Promise((resolve, reject) => {
     const segments =
@@ -127,11 +236,54 @@ function parseJsonStream(
 
     function pushFrame(mode: FrameMode, isArray: boolean, frameDepth: number,
                        target: string | null, navRest: string[]) {
+      // Only the root build frame of the scanned container runs the selector;
+      // it materializes elements to unlimited depth so filter predicates see
+      // the full item, not a depth-truncated stub.
+      const selScan = selector != null && mode === "build" && isArray && stack.length === 0;
       stack.push({
-        mode, isArray, depth: frameDepth,
+        mode, isArray, depth: selScan ? Number.POSITIVE_INFINITY : frameDepth,
         result: mode === "build" ? (isArray ? [] : {}) : null,
         count: 0, key: null, target, navRest, navIndex: -1,
+        selScan, selIndex: 0, selTotal: 0, selResults: [],
       });
+    }
+
+    function selectorResult(frame: Frame) {
+      return { [SELECTOR_RESULT]: true, results: frame.selResults, total: frame.selTotal };
+    }
+
+    /** Apply the selector expression to one completed array element and record
+     *  any matches. Positional accessors ([n], [n:m], [n:], [:m], [*]) select
+     *  by element index; anything else (filters [?(...)], recursive descent) is
+     *  evaluated against the element wrapped in a single-item array. */
+    function emitSelectorValue(frame: Frame, value: any) {
+      const acc = parseArrayAccessor(selector!);
+      if (acc) {
+        const idx = frame.selIndex++;
+        if (idx >= acc.start && idx < acc.end) {
+          const selected = acc.rest ? jsonpathMatch("$" + acc.rest, value) : [value];
+          for (const s of selected) {
+            if (frame.selTotal >= selectorOffset && frame.selResults.length < selectorLimit) {
+              frame.selResults.push(s);
+            }
+            frame.selTotal++;
+          }
+        }
+        // Finite end: total is known once the last selected element is done —
+        // stop scanning (drops the rest of the stream) instead of walking the
+        // whole container.
+        if (acc.end !== Infinity && idx + 1 >= acc.end) {
+          finish(selectorResult(frame));
+        }
+        return;
+      }
+      const matches = jsonpathMatch("$" + selector!, [value]);
+      for (const s of matches) {
+        if (frame.selTotal >= selectorOffset && frame.selResults.length < selectorLimit) {
+          frame.selResults.push(s);
+        }
+        frame.selTotal++;
+      }
     }
 
     function popFrame(eventName: string): any {
@@ -268,24 +420,31 @@ function parseJsonStream(
         }
         case "endObject":
         case "endArray": {
+          const popped = stack[stack.length - 1];
           const value = popFrame(event.name);
           if (stack.length === 0) {
-            finish(value);
+            if (popped.selScan) {
+              finish(selectorResult(popped));
+            } else {
+              finish(value);
+            }
             return;
           }
           const parent = stack[stack.length - 1];
           if (parent.mode === "build") {
-            if (parent.isArray) {
+            if (parent.selScan) {
+              emitSelectorValue(parent, value);
+            } else if (parent.isArray) {
               parent.result.push(value);
-              if (parent.result.length > MAX_PREVIEW_SIZE) {
+              if (parent.result.length > previewSize) {
                 parent.result.pop();
                 if (knownCount != null) {
-                  parent.result.push(truncatedMarker("array", knownCount - MAX_PREVIEW_SIZE));
+                  parent.result.push(truncatedMarker("array", knownCount - previewSize));
                   finish(parent.result);
                   return;
                 }
                 parent.mode = "skip";
-                parent.count = MAX_PREVIEW_SIZE + 1;
+                parent.count = previewSize + 1;
               }
             } else if (parent.key !== null) {
               parent.result[parent.key] = value;
@@ -298,17 +457,19 @@ function parseJsonStream(
         default: {
           const val = scalarFromEvent(event);
           if (frame.mode === "build") {
-            if (frame.isArray) {
+            if (frame.selScan) {
+              emitSelectorValue(frame, val);
+            } else if (frame.isArray) {
               frame.result.push(val);
-              if (frame.result.length > MAX_PREVIEW_SIZE) {
+              if (frame.result.length > previewSize) {
                 frame.result.pop();
                 if (knownCount != null) {
-                  frame.result.push(truncatedMarker("array", knownCount - MAX_PREVIEW_SIZE));
+                  frame.result.push(truncatedMarker("array", knownCount - previewSize));
                   finish(frame.result);
                   return;
                 }
                 frame.mode = "skip";
-                frame.count = MAX_PREVIEW_SIZE + 1;
+                frame.count = previewSize + 1;
               }
             } else if (frame.key !== null) {
               frame.result[frame.key] = val;
@@ -348,7 +509,17 @@ function parseJsonStream(
 // ── Index helpers (same pattern as json-level) ────────────────────────────
 
 function isValidIndex(idx: Record<string, any>): boolean {
-  if (!idx?.depth1 || typeof idx.depth1 !== "object") return false;
+  if (!idx || typeof idx !== "object") return false;
+  // Array-root file: buildIndex emits depth1 = null and no rootKeys, with "$"
+  // as the root array container. The root container being structurally sound
+  // is enough — accept it so we don't rebuild a huge index on every request.
+  if (idx.depth1 == null) {
+    const root = idx.containers?.["$"];
+    if (!root || typeof root !== "object") return false;
+    if (root.type !== "array") return false;
+    return root.offset != null && root.endOffset != null && root.endOffset >= root.offset;
+  }
+  if (typeof idx.depth1 !== "object") return false;
   const hasMarker = Object.values(idx.depth1).some(
     (v: any) => v && typeof v === "object" && v.__truncated__ != null,
   );
@@ -390,7 +561,8 @@ async function queryManifest(
   offset: number,
   limit: number,
 ): Promise<{ results: any[]; total: number }> {
-  const { rootKey, remaining } = extractRootKey(query);
+  let { rootKey, remaining } = extractRootKey(query);
+  if (!entry.chunks[rootKey] && entry.chunks["$"]) rootKey = "$";
   const chunkList = entry.chunks[rootKey];
   if (!chunkList) return { results: [], total: 0 };
 
@@ -502,6 +674,66 @@ function applyToValue(remaining: string, value: any): any[] {
 
 // ── Local disk query (streaming) ──────────────────────────────────────────
 
+/** Number of array items the local fallback should parse for a query. Filters
+ *  and positional selectors (`remaining` starting with `[`) must scan array
+ *  elements, so pull the whole container when its byte span is small enough;
+ *  otherwise keep the 10-item preview to avoid materializing a huge file. */
+function queryPreviewSize(remaining: string, byteSpan: number | undefined): number {
+  if (remaining && /^\[/.test(remaining) && byteSpan != null && byteSpan <= SAFE_QUERY_SCAN_BYTES) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  return MAX_PREVIEW_SIZE;
+}
+
+/** Whether a `[`-leading selector must be evaluated by streaming per-element
+ *  scan instead of materializing the container: the container is an array, and
+ *  it's too big to hold in memory (or its byte span is unknown). */
+function needsSelector(
+  remaining: string,
+  byteSpan: number | undefined,
+  type?: string,
+): boolean {
+  if (!remaining || !/^\[/.test(remaining)) return false;
+  if (type != null && type !== "array") return false;
+  if (byteSpan == null) return true;
+  return byteSpan > SAFE_QUERY_SCAN_BYTES;
+}
+
+/** Parse a byte window of a local file and evaluate the query's `remaining`
+ *  fragment against it — either by materializing the container (small byte
+ *  span) or via the streaming per-element selector scan (large span). Returns
+ *  null when the container can't be resolved. */
+async function runQueryOnRange(
+  filePath: string,
+  jsonPath: string,
+  remaining: string,
+  depth: number,
+  knownCount: number | undefined,
+  start: number,
+  end: number | undefined,
+  containerType: string | undefined,
+  offset: number,
+  limit: number,
+): Promise<{ results: any[]; total: number } | null> {
+  const byteSpan = end != null ? end - start : undefined;
+  const fileStream = createReadStream(filePath, { start, end });
+  if (needsSelector(remaining, byteSpan, containerType)) {
+    const scan = await parseJsonStream(
+      fileStream, jsonPath, depth, knownCount, MAX_PREVIEW_SIZE,
+      remaining, offset, limit,
+    );
+    if (scan === undefined) return null;
+    if (isSelectorResult(scan)) return { results: scan.results, total: scan.total };
+    return applyQueryResults(scan, remaining, offset, limit);
+  }
+  const rootData = await parseJsonStream(
+    fileStream, jsonPath, depth, knownCount,
+    queryPreviewSize(remaining, byteSpan),
+  );
+  if (rootData === undefined) return null;
+  return applyQueryResults(rootData, remaining, offset, limit);
+}
+
 async function queryLocal(
   id: string,
   query: string,
@@ -523,11 +755,11 @@ async function queryLocal(
     if (index.containers?.[containerPath]) {
       const ci = index.containers[containerPath];
       if (ci.offset != null) {
-        const fileStream = createReadStream(filePath, { start: ci.offset, end: ci.endOffset });
-        const rootData = await parseJsonStream(fileStream, "$", depth, ci.count);
-        if (rootData !== undefined) {
-          return applyQueryResults(rootData, remaining, offset, limit);
-        }
+        const r = await runQueryOnRange(
+          filePath, "$", remaining, depth, ci.count,
+          ci.offset, ci.endOffset, ci.type, offset, limit,
+        );
+        if (r !== null) return r;
       }
     }
 
@@ -538,12 +770,11 @@ async function queryLocal(
         const ancestorPath = (i === 0 ? "$" : "$." + segs.slice(0, i).join("."));
         const anc = index.containers[ancestorPath];
         if (anc?.offset != null) {
-          const subPath = segs.slice(i).join(".");
-          const fileStream = createReadStream(filePath, { start: anc.offset, end: anc.endOffset });
-          const rootData = await parseJsonStream(fileStream, subPath, depth, anc.count);
-          if (rootData !== undefined) {
-            return applyQueryResults(rootData, remaining, offset, limit);
-          }
+          const r = await runQueryOnRange(
+            filePath, segs.slice(i).join("."), remaining, depth, anc.count,
+            anc.offset, anc.endOffset, anc.type, offset, limit,
+          );
+          if (r !== null) return r;
         }
       }
     }
@@ -552,23 +783,25 @@ async function queryLocal(
     if (index.rootKeys?.[rootKey]) {
       const keyInfo = index.rootKeys[rootKey];
       if (keyInfo?.offset != null) {
-        const fileStream = createReadStream(filePath, { start: keyInfo.offset, end: keyInfo.endOffset });
-        const rootData = await parseJsonStream(fileStream, "$", depth, keyInfo.count);
-        if (rootData !== undefined) {
-          return applyQueryResults(rootData, remaining, offset, limit);
-        }
+        const r = await runQueryOnRange(
+          filePath, "$", remaining, depth, keyInfo.count,
+          keyInfo.offset, keyInfo.endOffset, undefined, offset, limit,
+        );
+        if (r !== null) return r;
       }
     }
   }
 
   // Fallback: stream-parse the entire file
   const jsonPath = rootKey ? `$.${rootKey}` : "$";
-  const fileStream = createReadStream(filePath);
-  const rootData = await parseJsonStream(fileStream, jsonPath, depth);
+  const fileSize = statSync(filePath).size;
+  const r = await runQueryOnRange(
+    filePath, jsonPath, remaining, depth, undefined,
+    0, fileSize, undefined, offset, limit,
+  );
+  if (r !== null) return r;
 
-  if (rootData === undefined) return { results: [], total: 0 };
-
-  return applyQueryResults(rootData, remaining, offset, limit);
+  return { results: [], total: 0 };
 }
 
 function applyQueryResults(
@@ -580,7 +813,19 @@ function applyQueryResults(
   const results: any[] = [];
   if (remaining) {
     const expr = `$${remaining}`;
-    if (Array.isArray(rootData)) {
+    if (Array.isArray(rootData) && /^\[/.test(remaining)) {
+      // Root-level selector on an array: a filter (`[?(...)]`) or positional
+      // accessor targets the array itself, not a single element — jsonpath-plus
+      // never matches a filter applied to one object, so evaluate over the whole
+      // array at once.
+      try {
+        const matches = jsonpath(expr, rootData);
+        if (Array.isArray(matches)) results.push(...matches);
+        else if (matches !== undefined && matches !== null) results.push(matches);
+      } catch {
+        // Expression didn't match
+      }
+    } else if (Array.isArray(rootData)) {
       for (const item of rootData) {
         try {
           const matches = jsonpath(expr, item);
@@ -625,16 +870,26 @@ async function queryRemote(
 
     const contentType = res.headers.get("content-type") || "";
     const contentLength = Number(res.headers.get("content-length") || 0);
+    const byteSpan = contentLength > 0 ? contentLength : undefined;
+
+    const { remaining } = extractRootKey(query);
 
     // Stream-parse the response body
     if (res.body) {
       const webStream = res.body;
       const nodeStream = Readable.fromWeb(webStream as any);
       const jsonPath = rootKey ? `$.${rootKey}` : "$";
-      const rootData = await parseJsonStream(nodeStream, jsonPath, depth);
+      if (needsSelector(remaining, byteSpan)) {
+        const scan = await parseJsonStream(
+          nodeStream, jsonPath, depth, undefined, MAX_PREVIEW_SIZE,
+          remaining, offset, limit,
+        );
+        if (scan === undefined) return { results: [], total: 0 };
+        if (isSelectorResult(scan)) return { results: scan.results, total: scan.total };
+        return applyQueryResults(scan, remaining, offset, limit);
+      }
+      const rootData = await parseJsonStream(nodeStream, jsonPath, depth, undefined, queryPreviewSize(remaining, byteSpan));
       if (rootData === undefined) return { results: [], total: 0 };
-
-      const { remaining } = extractRootKey(query);
       return applyQueryResults(rootData, remaining, offset, limit);
     }
 
@@ -643,8 +898,6 @@ async function queryRemote(
     const data = JSON.parse(text);
     const rootData = rootKey ? data[rootKey] : data;
     if (rootData === undefined) return { results: [], total: 0 };
-
-    const { remaining } = extractRootKey(query);
     return applyQueryResults(rootData, remaining, offset, limit);
   } catch {
     return { results: [], total: 0 };
@@ -662,7 +915,7 @@ export async function POST(req: NextRequest) {
   }
 
   const id = body.id?.trim();
-  const query = body.query?.trim();
+  const query = normalizeFilterQuery(body.query?.trim() ?? "");
   const depth = Math.max(0, Math.min(body.depth ?? 2, 12));
   const offset = Math.max(0, body.offset ?? 0);
   const limit = Math.max(1, Math.min(body.limit ?? 100, 1000));
@@ -673,10 +926,22 @@ export async function POST(req: NextRequest) {
   if (!query) {
     return NextResponse.json({ error: "Missing 'query'" }, { status: 400 });
   }
+  // The `?{...}` filter typo is rewritten to `?(...)` above; anything left is a
+  // form jsonpath-plus silently ignores — reject it instead of returning an
+  // empty result set.
+  if (/\[\?\{/.test(query)) {
+    return NextResponse.json(
+      { error: `Unsupported filter syntax '?{...}' — use '?(...)': ${query}` },
+      { status: 400 },
+    );
+  }
 
-  // Validate the JSONPath expression by trying to parse it
+  // Validate the JSONPath expression by trying to parse it. Run it against a
+  // truthy-sink array instead of a plain object so filter predicates that call
+  // string methods (e.g. `@.name.includes('NIFTY')`) don't false-positive on
+  // property access against undefined.
   try {
-    jsonpath(query.replace(/^\$/, "$"), { _placeholder: true });
+    jsonpath(query, [validationSink()]);
   } catch (e: any) {
     return NextResponse.json(
       { error: `Invalid JSONPath expression: ${e.message ?? query}` },
@@ -691,9 +956,12 @@ export async function POST(req: NextRequest) {
     let results: any[];
     let total: number;
 
-    // 1. Manifest-backed entry (Fastify)
+    // 1. Manifest-backed entry (Fastify). Only used when it actually has chunks
+    //    — a registered manifest with zero split chunks (e.g. a root-level
+    //    array the splitter can't split) can't satisfy any query, so fall
+    //    through to the local index/stream path instead of returning nothing.
     const manifestEntry = getManifestEntry(id);
-    if (manifestEntry) {
+    if (manifestEntry && Object.keys(manifestEntry.chunks ?? {}).length > 0) {
       console.log(`[json-query] manifest hit for ${id}`);
       const r = await queryManifest(manifestEntry, query, offset, limit);
       results = r.results;

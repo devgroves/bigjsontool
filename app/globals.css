@@ -306,6 +306,22 @@ body {
 }
 .jt-chunk-row .jt-chunk-label { opacity: 0.75; font-style: italic; cursor: pointer; }
 
+/* Custom depth entry — sized like a toolbar button but accepts a number */
+.jt-btn.jt-depth-input {
+  width: 64px;
+  color-scheme: dark;
+  font-family: Consolas, Menlo, Monaco, "Courier New", monospace;
+}
+.jt-btn.jt-depth-input::-webkit-outer-spin-button,
+.jt-btn.jt-depth-input::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+.jt-btn.jt-depth-input {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
 .jt-btn:hover {
   background: #2a3142;
 }

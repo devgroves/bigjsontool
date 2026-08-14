@@ -10,8 +10,15 @@ import { resolveManifestValue } from "../../lib/manifestJsonValue";
 
 export const dynamic = "force-dynamic";
 
-function truncatedMarker(kind: "object" | "array", count: number) {
-  return { __truncated__: true, __kind__: kind, __count__: count };
+/** Synthetic object key used to hold a "more entries remain" marker when a
+ *  container (or the root object) is paginated. The client detects it by the
+ *  marker's VALUE shape, so the key itself never needs to match real data. */
+const RESERVED_MARKER_KEY = "\u2026"; // "…"
+
+function truncatedMarker(kind: "object" | "array", count: number, offset?: number) {
+  const marker: Record<string, unknown> = { __truncated__: true, __kind__: kind, __count__: count };
+  if (offset != null) marker.__offset__ = offset;
+  return marker;
 }
 
 const MAX_PREVIEW_SIZE = 10;
@@ -43,7 +50,13 @@ interface Frame {
   target: string | null;
   navRest: string[];
   navIndex: number;
-  arrayOffset: number;
+  /** Number of leading items/keys to skip when paging through a container. */
+  offset: number;
+  /** The offset this frame began at — used to compute the `__offset__` on a
+   *  remainder marker so the client knows where the next page starts. */
+  startOffset: number;
+  /** Max entries kept in a build frame before it truncates to a marker. */
+  previewSize: number;
 }
 
 function parseJsonStream(
@@ -52,6 +65,7 @@ function parseJsonStream(
   depth: number,
   knownCount?: number,
   arrayOffset?: number,
+  previewSize: number = MAX_PREVIEW_SIZE,
 ): Promise<any> {
   return new Promise((resolve, reject) => {
     const segments =
@@ -70,30 +84,85 @@ function parseJsonStream(
 
     function pushFrame(mode: FrameMode, isArray: boolean, frameDepth: number,
                        target: string | null, navRest: string[],
-                       ao = 0) {
+                       offset = 0, startOffset = 0) {
       stack.push({
         mode, isArray, depth: frameDepth,
         result: mode === "build" ? (isArray ? [] : {}) : null,
-        count: 0, key: null, target, navRest, navIndex: -1, arrayOffset: ao,
+        count: 0, key: null, target, navRest, navIndex: -1,
+        offset, startOffset, previewSize,
       });
     }
 
     function popFrame(eventName: string): any {
       const frame = stack.pop()!;
+      const isRoot = stack.length === 0;
+      const rootOffset = isRoot ? frame.startOffset + frame.previewSize : undefined;
       if (frame.mode === "skip") {
         if (frame.result && frame.count > 0) {
-          const remaining = frame.count - (Array.isArray(frame.result) ? frame.result.length : 0);
+          const held = frame.isArray
+            ? (frame.result as any[]).length
+            : Object.keys(frame.result).length;
+          const remaining = frame.count - held;
           if (remaining > 0) {
-            (frame.result as any[]).push(
-              truncatedMarker(eventName === "endArray" ? "array" : "object", remaining)
+            const marker = truncatedMarker(
+              eventName === "endArray" ? "array" : "object",
+              remaining,
+              rootOffset,
             );
+            if (frame.isArray) (frame.result as any[]).push(marker);
+            else frame.result[frame.key ?? RESERVED_MARKER_KEY] = marker;
           }
           return frame.result;
         }
-        return truncatedMarker(eventName === "endArray" ? "array" : "object", frame.count);
+        return truncatedMarker(
+          eventName === "endArray" ? "array" : "object",
+          frame.count,
+          rootOffset,
+        );
       }
       if (frame.mode === "nav") return undefined;
       return frame.result;
+    }
+
+    /** Push a value (scalar or completed child container) into a build frame,
+     *  honoring paging offsets and preview-size truncation for BOTH arrays and
+     *  objects. The `knownCount` fast-path (which stops early with a remainder
+     *  marker) only applies to the ROOT frame — i.e. the container that was
+     *  actually fetched — since `knownCount` describes that container's
+     *  remaining entries. Nested frames just flip to skip-mode counting. */
+    function emitBuildValue(frame: Frame, value: any) {
+      const isRoot = stack.length === 1;
+      if (frame.isArray) {
+        if (frame.offset > 0) { frame.offset--; return; }
+        frame.result.push(value);
+        if (frame.result.length > frame.previewSize) {
+          frame.result.pop();
+          if (knownCount != null && isRoot) {
+            frame.result.push(truncatedMarker("array", knownCount - frame.previewSize));
+            finish(frame.result);
+            return;
+          }
+          frame.mode = "skip";
+          frame.count = frame.previewSize + 1;
+        }
+      } else if (frame.key !== null) {
+        if (frame.offset > 0) { frame.offset--; return; }
+        frame.result[frame.key] = value;
+        if (Object.keys(frame.result).length > frame.previewSize) {
+          delete frame.result[frame.key];
+          if (knownCount != null && isRoot) {
+            frame.result[frame.key] = truncatedMarker(
+              "object",
+              knownCount - frame.previewSize,
+              frame.startOffset + frame.previewSize,
+            );
+            finish(frame.result);
+            return;
+          }
+          frame.mode = "skip";
+          frame.count = frame.previewSize + 1;
+        }
+      }
     }
 
     function processToken(event: Token) {
@@ -108,8 +177,8 @@ function parseJsonStream(
           }
         } else {
           if (event.name === "startObject" || event.name === "startArray") {
-            const ao = event.name === "startArray" ? (arrayOffset ?? 0) : 0;
-            pushFrame("build", event.name === "startArray", depth, null, [], ao);
+            const ao = arrayOffset ?? 0;
+            pushFrame("build", event.name === "startArray", depth, null, [], ao, ao);
           } else {
             finish(scalarFromEvent(event));
           }
@@ -136,9 +205,9 @@ function parseJsonStream(
             frame.navIndex++;
             if (String(frame.navIndex) === frame.target) {
               stack.pop();
-              const aoArr = event.name === "startArray" ? (arrayOffset ?? 0) : 0;
+              const aoArr = arrayOffset ?? 0;
               if (frame.navRest.length === 0) {
-                pushFrame("build", event.name === "startArray", depth, null, [], aoArr);
+                pushFrame("build", event.name === "startArray", depth, null, [], aoArr, aoArr);
               } else {
                 pushFrame("nav", event.name === "startArray", -1, frame.navRest[0], frame.navRest.slice(1));
               }
@@ -172,9 +241,9 @@ function parseJsonStream(
           case "startArray": {
             if (frame.key === frame.target) {
               stack.pop();
-              const aoObj = event.name === "startArray" ? (arrayOffset ?? 0) : 0;
+              const aoObj = arrayOffset ?? 0;
               if (frame.navRest.length === 0) {
-                pushFrame("build", event.name === "startArray", depth, null, [], aoObj);
+                pushFrame("build", event.name === "startArray", depth, null, [], aoObj, aoObj);
               } else {
                 pushFrame("nav", event.name === "startArray", -1, frame.navRest[0], frame.navRest.slice(1));
               }
@@ -206,7 +275,7 @@ function parseJsonStream(
         case "startObject":
         case "startArray": {
           const isArr = event.name === "startArray";
-          if (frame.mode === "skip" || frame.depth - 1 <= 0 || frame.arrayOffset > 0) {
+          if (frame.mode === "skip" || frame.depth - 1 <= 0 || frame.offset > 0) {
             pushFrame("skip", isArr, -1, null, []);
           } else {
             pushFrame("build", isArr, frame.depth - 1, null, []);
@@ -222,25 +291,7 @@ function parseJsonStream(
           }
           const parent = stack[stack.length - 1];
           if (parent.mode === "build") {
-            if (parent.isArray) {
-              if (parent.arrayOffset > 0) {
-                parent.arrayOffset--;
-                return;
-              }
-              parent.result.push(value);
-              if (parent.result.length > MAX_PREVIEW_SIZE) {
-                parent.result.pop();
-                if (knownCount != null) {
-                  parent.result.push(truncatedMarker("array", knownCount - MAX_PREVIEW_SIZE));
-                  finish(parent.result);
-                  return;
-                }
-                parent.mode = "skip";
-                parent.count = MAX_PREVIEW_SIZE + 1;
-              }
-            } else if (parent.key !== null) {
-              parent.result[parent.key] = value;
-            }
+            emitBuildValue(parent, value);
           } else if (parent.mode === "skip") {
             parent.count++;
           }
@@ -249,25 +300,7 @@ function parseJsonStream(
         default: {
           const val = scalarFromEvent(event);
           if (frame.mode === "build") {
-            if (frame.isArray) {
-              if (frame.arrayOffset > 0) {
-                frame.arrayOffset--;
-                return;
-              }
-              frame.result.push(val);
-              if (frame.result.length > MAX_PREVIEW_SIZE) {
-                frame.result.pop();
-                if (knownCount != null) {
-                  frame.result.push(truncatedMarker("array", knownCount - MAX_PREVIEW_SIZE));
-                  finish(frame.result);
-                  return;
-                }
-                frame.mode = "skip";
-                frame.count = MAX_PREVIEW_SIZE + 1;
-              }
-            } else if (frame.key !== null) {
-              frame.result[frame.key] = val;
-            }
+            emitBuildValue(frame, val);
           } else {
             frame.count++;
           }
@@ -308,11 +341,12 @@ function extractFromFile(
   endOffset?: number,
   knownCount?: number,
   arrayOffset?: number,
+  previewSize?: number,
 ): Promise<any> {
   const fileStream = startOffset != null
     ? createReadStream(filePath, { start: startOffset, end: endOffset })
     : createReadStream(filePath);
-  return parseJsonStream(fileStream, jsonPath, depth, knownCount, arrayOffset);
+  return parseJsonStream(fileStream, jsonPath, depth, knownCount, arrayOffset, previewSize);
 }
 
 function extractFromText(
@@ -321,9 +355,10 @@ function extractFromText(
   depth: number,
   knownCount?: number,
   arrayOffset?: number,
+  previewSize?: number,
 ): Promise<any> {
   const textStream = Readable.from([text]);
-  return parseJsonStream(textStream, jsonPath, depth, knownCount, arrayOffset);
+  return parseJsonStream(textStream, jsonPath, depth, knownCount, arrayOffset, previewSize);
 }
 
 /** Minimal validity check.  A corrupted index from the earlier inString bug
@@ -331,7 +366,18 @@ function extractFromText(
  *  causing the root-expansion loop to silently do nothing and fall through
  *  to the slow path.  We detect that pattern here and force a rebuild. */
 function isValidIndex(idx: Record<string, any>): boolean {
-  if (!idx?.depth1 || typeof idx.depth1 !== "object") return false;
+  if (!idx || typeof idx !== "object") return false;
+  // Array-root file: buildIndex emits depth1 = null and no rootKeys, with "$"
+  // as the root array container. A structurally sound root container is enough
+  // — accept it so we don't rebuild a huge index on every expand (which made
+  // tree expansion appear to "do nothing" for multi-GB array-root uploads).
+  if (idx.depth1 == null) {
+    const root = idx.containers?.["$"];
+    if (!root || typeof root !== "object") return false;
+    if (root.type !== "array") return false;
+    return root.offset != null && root.endOffset != null && root.endOffset >= root.offset;
+  }
+  if (typeof idx.depth1 !== "object") return false;
   const hasMarker = Object.values(idx.depth1).some(
     (v: any) => v && typeof v === "object" && v.__truncated__ != null,
   );
@@ -370,20 +416,25 @@ export async function GET(req: NextRequest) {
   const jsonPath = searchParams.get("path") || "$";
   const depth = Math.max(0, Math.min(Number(searchParams.get("depth")) || 1, 12));
   const offset = Math.max(0, Number(searchParams.get("offset")) || 0);
+  const limit = Math.max(1, Math.min(Number(searchParams.get("limit")) || MAX_PREVIEW_SIZE, 1000));
 
   if (!id || !isValidId(id)) {
     return NextResponse.json({ error: "Missing or invalid 'id'" }, { status: 400 });
   }
 
   // ── Manifest-backed entry (Fastify) — checked first ────────────────────
+  // A registered manifest with zero split chunks (root-level array the splitter
+  // can't split) can't resolve anything — skipping it lets the local disk path
+  // below serve the real tree instead of an empty object.
   const manifestEntry = getManifestEntry(id);
-  if (manifestEntry) {
+  console.info(`[json-level] manifest entry ${manifestEntry}`);
+  if (manifestEntry && Object.keys(manifestEntry.chunks ?? {}).length > 0) {
     const startMs = Date.now();
-    console.log(`[json-level] manifest hit for ${id}, path=${jsonPath}, depth=${depth}, offset=${offset}`);
+    console.info(`[json-level] manifest hit for ${id}, path=${jsonPath}, depth=${depth}, offset=${offset}`);
     try {
-      const value = await resolveManifestValue(manifestEntry, jsonPath, depth, offset);
+      const value = await resolveManifestValue(manifestEntry, jsonPath, depth, offset, limit);
       const elapsed = Date.now() - startMs;
-      console.log(`[json-level] manifest resolved in ${elapsed}ms, path=${jsonPath}`);
+      console.info(`[json-level] manifest resolved in ${elapsed}ms, path=${jsonPath}`);
       if (value === undefined) {
         return NextResponse.json({ error: `Path '${jsonPath}' not found` }, { status: 404 });
       }
@@ -401,7 +452,16 @@ export async function GET(req: NextRequest) {
     const re = remoteEntry;
     if (jsonPath === "$" && depth === 1) {
       if (re.depth1Snapshot) {
-        return NextResponse.json({ path: "$", depth: 1, value: re.depth1Snapshot });
+        const entries = Object.entries(re.depth1Snapshot);
+        const total = entries.length;
+        if (offset >= total) return NextResponse.json({ path: "$", depth: 1, value: {} });
+        const page = entries.slice(offset, offset + limit);
+        const value: Record<string, any> = {};
+        for (const [k, v] of page) value[k] = v;
+        if (offset + page.length < total) {
+          value[RESERVED_MARKER_KEY] = truncatedMarker("object", total - offset - page.length, offset + page.length);
+        }
+        return NextResponse.json({ path: "$", depth: 1, value });
       }
       return NextResponse.json({ status: "loading" });
     }
@@ -422,7 +482,7 @@ export async function GET(req: NextRequest) {
         if (ci.offset != null) {
           try {
             const text = await rangeFetch(re.url, ci.offset, ci.endOffset);
-            return await extractFromText(text, "$", depth, (ci.count ?? 0) - offset, offset || undefined);
+            return await extractFromText(text, "$", depth, (ci.count ?? 0) - offset, offset || undefined, limit);
           } catch { /* fall through */ }
         }
       }
@@ -436,7 +496,7 @@ export async function GET(req: NextRequest) {
             const subPath = segs.slice(i).join(".");
             try {
               const text = await rangeFetch(re.url, anc.offset, anc.endOffset);
-              return await extractFromText(text, subPath, depth, (anc.count ?? 0) - offset, offset || undefined);
+              return await extractFromText(text, subPath, depth, (anc.count ?? 0) - offset, offset || undefined, limit);
             } catch { return undefined; }
           }
         }
@@ -450,7 +510,7 @@ export async function GET(req: NextRequest) {
           const subPath = segs.length > 1 ? segs.slice(1).join(".") : "$";
           try {
             const text = await rangeFetch(re.url, keyInfo.offset, keyInfo.endOffset);
-            return await extractFromText(text, subPath, depth, (keyInfo.count ?? 0) - offset, offset || undefined);
+            return await extractFromText(text, subPath, depth, (keyInfo.count ?? 0) - offset, offset || undefined, limit);
           } catch { return undefined; }
         }
       }
@@ -466,13 +526,21 @@ export async function GET(req: NextRequest) {
       }
     }
 
-    // depth>1 at root — expand root containers via per-child Range-fetches
+    // depth>1 at root — expand root containers via per-child Range-fetches,
+    // paginated over top-level keys [offset, offset+limit).
     if (idxHasDepth1(index) && idxHasContainers(index) && jsonPath === "$" && depth > 1) {
       const cm = index.containers as Record<string, { offset: number; endOffset?: number; count?: number; type: string }>;
-      const base = JSON.parse(JSON.stringify(index.depth1));
-      let anyExpanded = false;
+      const entries = Object.entries(index.depth1);
+      const total = entries.length;
+      if (offset >= total) return NextResponse.json({ path: "$", depth, value: {} });
+      const base: Record<string, any> = {};
+      let consumed = 0;
 
-      for (const [key, marker] of Object.entries(base)) {
+      for (const [key, marker] of entries) {
+        if (consumed < offset) { consumed++; continue; }
+        if (consumed >= offset + limit) break;
+        consumed++;
+        base[key] = marker;
         const m = marker as any;
         if (!m || typeof m !== "object" || !m.__truncated__) continue;
         const containerPath = `$.${key}`;
@@ -488,7 +556,7 @@ export async function GET(req: NextRequest) {
             if (childInfo?.offset != null) {
               try {
                 const text = await rangeFetch(re.url, childInfo.offset, childInfo.endOffset);
-                const child = await extractFromText(text, "$", depth - 1, childInfo.count);
+                const child = await extractFromText(text, "$", depth - 1, childInfo.count, 0, limit);
                 if (child !== undefined) items.push(child);
                 else items.push(truncatedMarker(childInfo.type as "object" | "array", childInfo.count ?? 0));
               } catch {
@@ -503,22 +571,19 @@ export async function GET(req: NextRequest) {
             items.push(truncatedMarker("array", remaining));
           }
           base[key] = items;
-          anyExpanded = true;
         } else {
           try {
             const text = await rangeFetch(re.url, ci.offset, ci.endOffset);
-            const expanded = await extractFromText(text, "$", depth - 1, ci.count);
-            if (expanded !== undefined) {
-              base[key] = expanded;
-              anyExpanded = true;
-            }
+            const expanded = await extractFromText(text, "$", depth - 1, ci.count, 0, limit);
+            if (expanded !== undefined) base[key] = expanded;
           } catch { /* keep marker */ }
         }
       }
 
-      if (anyExpanded) {
-        return NextResponse.json({ path: "$", depth, value: base });
+      if (offset + limit < total) {
+        base[RESERVED_MARKER_KEY] = truncatedMarker("object", total - offset - limit, offset + limit);
       }
+      return NextResponse.json({ path: "$", depth, value: base });
     }
 
     // No path resolved or index incomplete
@@ -535,11 +600,20 @@ export async function GET(req: NextRequest) {
   }
 
   const index = loadOrBuildIndex(id, basePath);
-
+  console.info(`[json-level] index build index${id}, path=${jsonPath}, depth=${depth}, offset=${offset}, limit=${limit}`);
   if (index?.depth1 && jsonPath === "$" && depth === 1) {
-    return NextResponse.json({ path: "$", depth: 1, value: index.depth1 });
+    const entries = Object.entries(index.depth1 as Record<string, any>);
+    const total = entries.length;
+    if (offset >= total) return NextResponse.json({ path: "$", depth: 1, value: {} });
+    const page = entries.slice(offset, offset + limit);
+    const value: Record<string, any> = {};
+    for (const [k, v] of page) value[k] = v;
+    if (offset + page.length < total) {
+      value[RESERVED_MARKER_KEY] = truncatedMarker("object", total - offset - page.length, offset + page.length);
+    }
+    return NextResponse.json({ path: "$", depth: 1, value });
   }
-
+  console.info
   async function resolvePath(path: string): Promise<any | undefined> {
     if (!index) return undefined;
     const segs = path.replace(/^\$\.?/, "").split(".").filter(Boolean);
@@ -551,7 +625,7 @@ export async function GET(req: NextRequest) {
           return await extractFromFile(
             basePath, "$", depth,
             ci.offset, ci.endOffset, (ci.count ?? 0) - offset,
-            offset || undefined,
+            offset || undefined, limit,
           );
         } catch { /* fall through */ }
       }
@@ -567,7 +641,7 @@ export async function GET(req: NextRequest) {
             return await extractFromFile(
               basePath, subPath, depth,
               anc.offset, anc.endOffset, (anc.count ?? 0) - offset,
-              offset || undefined,
+              offset || undefined, limit,
             );
           } catch { return undefined; }
         }
@@ -583,7 +657,7 @@ export async function GET(req: NextRequest) {
           return await extractFromFile(
             basePath, subPath, depth,
             keyInfo.offset, keyInfo.endOffset, (keyInfo.count ?? 0) - offset,
-            offset || undefined,
+            offset || undefined, limit,
           );
         } catch { return undefined; }
       }
@@ -598,13 +672,20 @@ export async function GET(req: NextRequest) {
       return NextResponse.json({ path: jsonPath, depth, value: val });
     }
   }
-
+  console.info(`[json-level] crossed $ file fetch for ${id}, path=${jsonPath}, depth=${depth}, offset=${offset}, limit=${limit}`);
   if (index?.depth1 && index?.containers && jsonPath === "$" && depth > 1) {
     const cm = index.containers as Record<string, { offset: number; endOffset?: number; count?: number; type: string }>;
-    const base = JSON.parse(JSON.stringify(index.depth1));
-    let anyExpanded = false;
+    const entries = Object.entries(index.depth1 as Record<string, any>);
+    const total = entries.length;
+    if (offset >= total) return NextResponse.json({ path: "$", depth, value: {} });
+    const base: Record<string, any> = {};
+    let consumed = 0;
 
-    for (const [key, marker] of Object.entries(base)) {
+    for (const [key, marker] of entries) {
+      if (consumed < offset) { consumed++; continue; }
+      if (consumed >= offset + limit) break;
+      consumed++;
+      base[key] = marker;
       const m = marker as any;
       if (!m || typeof m !== "object" || !m.__truncated__) continue;
       const containerPath = `$.${key}`;
@@ -622,6 +703,7 @@ export async function GET(req: NextRequest) {
               const child = await extractFromFile(
                 basePath, "$", depth - 1,
                 childInfo.offset, childInfo.endOffset, childInfo.count,
+                undefined, limit,
               );
               if (child !== undefined) items.push(child);
               else items.push(truncatedMarker(childInfo.type as "object" | "array", childInfo.count ?? 0));
@@ -637,29 +719,29 @@ export async function GET(req: NextRequest) {
           items.push(truncatedMarker("array", remaining));
         }
         base[key] = items;
-        anyExpanded = true;
       } else {
         try {
           const expanded = await extractFromFile(
             basePath, "$", depth - 1,
             ci.offset, ci.endOffset, ci.count,
+            undefined, limit,
           );
-          if (expanded !== undefined) {
-            base[key] = expanded;
-            anyExpanded = true;
-          }
+          if (expanded !== undefined) base[key] = expanded;
         } catch { /* keep marker */ }
       }
     }
 
-    if (anyExpanded) {
-      return NextResponse.json({ path: "$", depth, value: base });
+    if (offset + limit < total) {
+      base[RESERVED_MARKER_KEY] = truncatedMarker("object", total - offset - limit, offset + limit);
     }
+    return NextResponse.json({ path: "$", depth, value: base });
   }
-
+  console.info(`[json-level] index depth file fetch for ${id}, path=${jsonPath}, depth=${depth}, offset=${offset}, limit=${limit}`);
   let value: any;
   try {
-    value = await extractFromFile(basePath, jsonPath, depth, undefined, undefined, undefined, offset || undefined);
+    const rootInfo = index?.containers?.["$"] as { count?: number } | undefined;
+    const rootKnownCount = rootInfo?.count != null ? rootInfo.count - (offset || 0) : undefined;
+    value = await extractFromFile(basePath, jsonPath, depth, undefined, undefined, rootKnownCount, offset || undefined, limit);
   } catch (err: any) {
     return NextResponse.json(
       { error: `Stored file is not valid JSON, or is truncated: ${err?.message ?? "parse error"}` },

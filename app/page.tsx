@@ -111,59 +111,6 @@ export default function Home() {
     }
   }, [trackDownloadProgress, count, chunkSize, delayMs]);
 
-  // "Import from disk": upload immediately, then use the returned id
-  // directly. There's no need to stream the file back down at all just to
-  // populate the editor — it's already fully saved server-side, and the
-  // editor/tree fetch what they need by window/level on their own.
-  const handleFileSelected = useCallback(
-    async (e: React.ChangeEvent<HTMLInputElement>) => {
-      const file = e.target.files?.[0];
-      e.target.value = ""; // allow re-selecting the same file
-      if (!file) return;
-
-      setBytes(0);
-      setElapsedMs(0);
-      setError(null);
-      setImportedName(file.name);
-      setFileId(null);
-      setStatus("uploading");
-
-      const controller = new AbortController();
-      abortRef.current = controller;
-
-      try {
-        const form = new FormData();
-        form.append("file", file);
-
-        const startTime = performance.now();
-        const uploadRes = await fetch("/api/upload", {
-          method: "POST",
-          body: form,
-          signal: controller.signal,
-        });
-
-        if (!uploadRes.ok) {
-          const body = await uploadRes.json().catch(() => ({}));
-          throw new Error(body?.error || `Upload failed with ${uploadRes.status}`);
-        }
-
-        const body = await uploadRes.json();
-        setBytes(body.size ?? file.size);
-        setElapsedMs(performance.now() - startTime);
-        setFileId(body.id);
-        setStatus("done");
-      } catch (e: any) {
-        if (e.name === "AbortError") {
-          setStatus("idle");
-        } else {
-          setStatus("error");
-          setError(e.message || "Something went wrong while importing the file.");
-        }
-      }
-    },
-    []
-  );
-
   // Opens the SSE index-build stream for `id` and resolves once the server
   // sends `done` (or rejects on `error`). Drives indexProgress along the
   // way. This is what replaces the old "build index inline during
@@ -203,6 +150,70 @@ export default function Home() {
       });
     });
   }, []);
+
+  // "Import from disk": upload immediately, then use the returned id
+  // directly. There's no need to stream the file back down at all just to
+  // populate the editor — it's already fully saved server-side, and the
+  // editor/tree fetch what they need by window/level on their own.
+  const handleFileSelected = useCallback(
+    async (e: React.ChangeEvent<HTMLInputElement>) => {
+      const file = e.target.files?.[0];
+      e.target.value = ""; // allow re-selecting the same file
+      if (!file) return;
+
+      setBytes(0);
+      setElapsedMs(0);
+      setError(null);
+      setImportedName(file.name);
+      setFileId(null);
+      setIndexProgress(null);
+      setStatus("uploading");
+
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      try {
+        const form = new FormData();
+        form.append("file", file);
+
+        const startTime = performance.now();
+        const uploadRes = await fetch("/api/upload", {
+          method: "POST",
+          body: form,
+          signal: controller.signal,
+        });
+
+        if (!uploadRes.ok) {
+          const body = await uploadRes.json().catch(() => ({}));
+          throw new Error(body?.error || `Upload failed with ${uploadRes.status}`);
+        }
+
+        const body = await uploadRes.json();
+        setBytes(body.size ?? file.size);
+        setElapsedMs(performance.now() - startTime);
+        setFileId(body.id);
+
+        // The upload route no longer builds an index inline. Mirror the URL
+        // import flow: stream the index build via SSE — pyjson-splitter is
+        // tried by default, falling back to a local byte-offset index if the
+        // splitter is unreachable — and don't treat the import as finished
+        // until it reports `done`.
+        setStatus("indexing");
+        setIndexProgress(0);
+        await waitForIndex(body.id);
+
+        setStatus("done");
+      } catch (e: any) {
+        if (e.name === "AbortError") {
+          setStatus("idle");
+        } else {
+          setStatus("error");
+          setError(e.message || "Something went wrong while importing the file.");
+        }
+      }
+    },
+    [waitForIndex]
+  );
 
   const handleImportUrl = useCallback(async () => {
     const url = importUrl.trim();
