@@ -85,12 +85,19 @@ function normalizeFilterQuery(query: string): string {
     .replace(
       /(@\.[\w$[\].]+)\s*(not\s+contains|contains)\s+('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")/g,
       (_m, target: string, op: string, literal: string) =>
-        `${op === "not contains" ? "!" : ""}${target}.includes(${literal})`,
+        op === "not contains"
+          ? `!${target} || !${target}.includes(${literal})`
+          : `(${target} && ${target}.includes(${literal}))`,
     )
     .replace(
-      /(@\.[\w$[\].]+)\.(?:include|contains)\s*\(('(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\)/g,
+      /(@\.[\w$[\].]+)\.(?:include|contains)\s*\((?:'(?:[^'\\]|\\.)*'|"(?:[^"\\]|\\.)*")\)/g,
       (_m, target: string, literal: string) =>
-        `${target}.includes(${literal})`,
+        `(${target} && ${target}.includes(${literal}))`,
+    )
+    .replace(
+      /(@\.[\w$[\].]+)\.includes\(([^)]+)\)/g,
+      (_m, target: string, args: string) =>
+        `(${target} && ${target}.includes(${args}))`,
     );
 }
 

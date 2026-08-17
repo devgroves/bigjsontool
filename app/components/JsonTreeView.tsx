@@ -51,10 +51,8 @@ const RESERVED_MARKER_KEY = "\u2026";
  *  reachable via expand-on-demand placeholders, which keeps a huge file
  *  from ever being materialized in one response. Configurable via
  *  NEXT_PUBLIC_TREE_MAX_DEPTH (clamped to the server's 12-level cap). */
-const MAX_ROOT_DEPTH = Math.min(
-  Number(process.env.NEXT_PUBLIC_TREE_MAX_DEPTH) || 6,
-  12,
-);
+export const MAX_ROOT_DEPTH = 
+  Number(process.env.NEXT_PUBLIC_TREE_MAX_DEPTH) || 15;
 /** Batch size used for scroll-continuation fetches (bigger than the default
  *  10-item preview so scrolling doesn't hammer the server). */
 const CONTINUATION_PAGE = 200;
@@ -130,7 +128,7 @@ function defaultCollapseFn(_key: string | null, value: JsonValue): boolean {
  *  isn't replicated server-side. */
 function presetToServerDepth(preset: CollapsedSetting): number {
   if (typeof preset === "number") return preset;
-  if (preset === true) return 8;
+  if (preset === true) return MAX_ROOT_DEPTH;
   if (preset === false) return 1;
   return 3;
 }
@@ -643,7 +641,7 @@ export default function JsonTreeView({
   fileId = null,
   defaultExpandDepth = true,
   rowHeight = 22,
-  groupSize = 100,
+  groupSize = fileId ? Number.POSITIVE_INFINITY : 100,
   fullWidth = false,
   onToggleFullWidth,
 }: JsonTreeViewProps) {
@@ -747,7 +745,7 @@ export default function JsonTreeView({
       // must not silently jump to a deeper expansion.
       const batchDepth =
         parentJsonPath === "$"
-          ? Math.max(1, Math.min(presetToServerDepth(collapsed), MAX_ROOT_DEPTH))
+          ? Math.max(2, Math.min(presetToServerDepth(collapsed), MAX_ROOT_DEPTH))
           : phDepth;
 
       // Markers carrying an explicit __offset__ (object/root remainders) are

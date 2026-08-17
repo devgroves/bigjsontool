@@ -170,6 +170,11 @@ export async function resolveManifestValue(
   offset: number,
   limit: number = MAX_PREVIEW_SIZE,
 ): Promise<any> {
+
+  const rootKeys = Object.keys(entry.chunks ?? {});
+  const isRootArray = rootKeys.length === 1 && rootKeys[0] === "$";
+
+
   // Root.
   if (jsonPath === "$" || jsonPath === "") {
     // Single-chunk root-array manifests key their chunks under "$". The root
@@ -178,8 +183,6 @@ export async function resolveManifestValue(
     // and so root-array item pagination returns real items (offset is an
     // array-item index here, not a root-key index). Named-key manifests keep
     // the key-paging behavior below.
-    const rootKeys = Object.keys(entry.chunks ?? {});
-    const isRootArray = rootKeys.length === 1 && rootKeys[0] === "$";
     if (isRootArray && depth > 1) {
       const items = await sliceArray(entry, "$", offset, limit);
       const truncatedItems = items.map((it) => truncateByDepth(it, depth - 1));
@@ -219,8 +222,21 @@ export async function resolveManifestValue(
 
   console.info(`[json-level] resolveManifestValue called for ${jsonPath}, depth=${depth}, offset=${offset}, limit=${limit}`);
   const segs = jsonPath.replace(/^\$\.?/, "").split(".").filter(Boolean);
-  const topKey = segs[0];
-  const chunkList = entry.chunks[topKey];
+  let topKey = segs[0];
+  let chunkList = entry.chunks[topKey];
+
+
+  // Root-array manifest: the first segment is an array index, not a chunk
+  // key. Rewrite so the existing array branch handles it via "$" chunks.
+  if (!chunkList && isRootArray) {
+    topKey = "$";
+    chunkList = entry.chunks["$"];
+    // segs already has the numeric index as segs[0]; the array branch
+    // below (kind==="array") reads idx from segs[1], so we shift segs
+    // by inserting "$" as a synthetic root-key prefix.
+    segs.unshift("$");
+  }
+
   if (!chunkList) return undefined;
   const kind = await getKeyKind(entry, topKey);
 

@@ -138,6 +138,10 @@ export async function fastifyGet(
     if ("result" in body) return body.result;
     if ("value" in body) return body.value;
   }
+  // Fastify wraps every single-path result in an outer array (e.g.
+  // name query returns ["value"]). Unwrap the single-element wrapper so
+  // callers see the actual value type.
+  if (Array.isArray(body) && body.length === 1) return body[0];
   return body;
 }
 
