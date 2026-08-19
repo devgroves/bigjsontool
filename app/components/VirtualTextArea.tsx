@@ -213,7 +213,7 @@ export default function VirtualTextArea({ value, onChange, fileId = null }: Virt
             color: "var(--jt-linenum, #6b7078)",
             padding: "4px 10px",
             background: "var(--jt-editor-bg, #1e1e1e)",
-            borderBottom: "1px solid rgba(255,255,255,0.08)",
+            borderBottom: "1px solid var(--banner-border)",
           }}
         >
           Read-only preview — {ROW_CHARS} chars/row, fetched from server as you scroll

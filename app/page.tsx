@@ -3,6 +3,7 @@
 import { useCallback, useRef, useState } from "react";
 import JsonEditor from "./components/JsonEditor";
 import Spinner from "./components/Spinner";
+import ThemeToggle from "./components/ThemeToggle";
 
 type Status = "idle" | "uploading" | "streaming" | "downloading" | "indexing" | "done" | "error";
 
@@ -274,6 +275,7 @@ export default function Home() {
           <span className="dot" data-live={status === "streaming"} />
           <h1>Stream → Editor</h1>
         </div>
+        <ThemeToggle />
         <p className="sub">
           The backend generates a large JSON array on the fly (or you import a file from disk) —
           either way it's saved server-side, and the editor and tree view below fetch just the

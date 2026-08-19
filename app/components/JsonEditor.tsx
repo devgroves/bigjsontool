@@ -15,9 +15,9 @@ export default function JsonEditor({
   // initial `value` prop.
   const [text, setText] = useState(value);
 
-  // When true, the left text pane is hidden and the tree pane takes the full
-  // editor width.
-  const [treeFull, setTreeFull] = useState(false);
+  // When true, the left source panel is collapsed to a thin vertical strip and
+  // the tree pane takes the full editor width.
+  const [textCollapsed, setTextCollapsed] = useState(false);
 
   // Keep in sync if the parent passes a new `value` externally (e.g. new
   // bytes arriving from the stream). In remote mode (fileId set), content
@@ -32,16 +32,38 @@ export default function JsonEditor({
   return (
     <div className="editor-host" style={{ height: "100%" }}>
       <div className="editor-split" style={{ display: "flex", height: "100%" }}>
-        {!treeFull && (
+        {textCollapsed ? (
+          <div className="collapse-strip" onClick={() => setTextCollapsed(false)} title="Expand source panel">
+            <span className="collapse-strip-label">Source text</span>
+          </div>
+        ) : (
           <div
             className="textarea-wrapper"
             style={{
               flex: 1,
               minWidth: 0,
               height: "100%",
-              background: "var(--jt-editor-bg, #1e1e1e)",
             }}
           >
+            <div className="jt-toolbar">
+              <span className="jt-toolbar-title">Source Text</span>
+              <div className="jt-toolbar-actions" aria-label="Source text actions">
+                <button
+                  type="button"
+                  className="text-toggle"
+                  title="Collapse source panel"
+                  aria-label="Collapse source panel"
+                  onClick={() => setTextCollapsed(true)}
+                >
+                  <svg viewBox="0 0 16 16" width="14" height="14">
+                    <path
+                      d="M11 3 L5 8 L11 13 Z"
+                      fill="currentColor"
+                    />
+                  </svg>
+                </button>
+              </div>
+            </div>
             <VirtualTextArea value={text} onChange={setText} fileId={fileId} />
           </div>
         )}
@@ -51,8 +73,6 @@ export default function JsonEditor({
             source={text}
             fileId={fileId ?? null}
             defaultExpandDepth={true}
-            fullWidth={treeFull}
-            onToggleFullWidth={() => setTreeFull((v) => !v)}
           />
         </div>
       </div>

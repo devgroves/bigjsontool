@@ -80,11 +80,6 @@ interface JsonTreeViewProps {
   /** Arrays longer than this are grouped into expandable chunks, unless
    *  `ignoreLargeArray` is enabled. Default 100. */
   groupSize?: number;
-  /** When true, the tree pane occupies the full editor width (left text pane
-   *  hidden). Toggled by `onToggleFullWidth`. */
-  fullWidth?: boolean;
-  /** Callback to toggle full-width tree view. */
-  onToggleFullWidth?: () => void;
 }
 
 function isObject(v: unknown): v is Record<string, JsonValue> {
@@ -642,8 +637,6 @@ export default function JsonTreeView({
   defaultExpandDepth = true,
   rowHeight = 22,
   groupSize = fileId ? Number.POSITIVE_INFINITY : 100,
-  fullWidth = false,
-  onToggleFullWidth,
 }: JsonTreeViewProps) {
   // --- Local-parse mode (fileId not set): unchanged from before -----------
   const [debouncedSource, setDebouncedSource] = useState(source);
@@ -1052,18 +1045,6 @@ export default function JsonTreeView({
               if (e.target.value !== "" && Number.isFinite(n) && n >= 0) setCollapsed(n);
             }}
           />
-          
-          {onToggleFullWidth && (
-            <button
-              type="button"
-              className="jt-btn jt-btn-expand"
-              data-active={fullWidth}
-              title={fullWidth ? "Show text pane (split view)" : "Expand tree to full width"}
-              onClick={onToggleFullWidth}
-            >
-              {fullWidth ? "Split" : "Expand"}
-            </button>
-          )}
         </div>
       </div>
 
@@ -1117,8 +1098,8 @@ export default function JsonTreeView({
               alignItems: "center",
               justifyContent: "center",
               gap: 8,
-              background: "rgba(20, 22, 26, 0.55)",
-              color: "#e8eaed",
+              background: "var(--jt-loading-bg)",
+              color: "var(--jt-loading-fg)",
               fontSize: 13,
               zIndex: 5,
               pointerEvents: rows.length === 0 ? "auto" : "none",
