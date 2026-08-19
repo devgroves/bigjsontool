@@ -204,6 +204,48 @@ body {
   background: var(--jt-btn-hover);
 }
 
+.control-panels {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.control-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+}
+
+.control-panel summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+  user-select: none;
+  list-style: none;
+}
+
+.control-panel summary::-webkit-details-marker {
+  display: none;
+}
+
+.control-panel summary::before {
+  content: "▸";
+  font-size: 11px;
+  color: var(--muted);
+  transition: transform 150ms ease;
+}
+
+.control-panel[open] summary::before {
+  transform: rotate(90deg);
+}
+
 .controls {
   flex: 0 0 auto;
   display: flex;
@@ -211,9 +253,11 @@ body {
   align-items: center;
   gap: 14px;
   padding: 12px 14px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 10px;
+  border-top: 1px solid var(--border);
+}
+
+.controls-nowrap {
+  flex-wrap: nowrap;
 }
 
 .controls label {
@@ -271,7 +315,7 @@ body {
   display: flex;
   gap: 8px;
   align-items: center;
-  flex: 1 1 100%;
+  flex: 1;
   min-width: 0;
 }
 

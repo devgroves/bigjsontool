@@ -283,86 +283,96 @@ export default function Home() {
         </p>
       </header>
 
-      <section className="controls">
-        <label>
-          Records
-          <input
-            type="number"
-            min={100}
-            max={2000000}
-            step={100}
-            value={count}
-            disabled={busy}
-            onChange={(e: { target: { value: any; }; }) => setCount(Number(e.target.value))}
-          />
-        </label>
-        <label>
-          Chunk size
-          <input
-            type="number"
-            min={10}
-            max={5000}
-            step={10}
-            value={chunkSize}
-            disabled={busy}
-            onChange={(e: { target: { value: any; }; }) => setChunkSize(Number(e.target.value))}
-          />
-        </label>
-        <label>
-          Delay / chunk (ms)
-          <input
-            type="number"
-            min={0}
-            max={1000}
-            step={5}
-            value={delayMs}
-            disabled={busy}
-            onChange={(e: { target: { value: any; }; }) => setDelayMs(Number(e.target.value))}
-          />
-        </label>
+      <section className="control-panels">
+        <details className="control-panel">
+          <summary>Generate</summary>
+          <div className="controls controls-nowrap">
+            <label>
+              Records
+              <input
+                type="number"
+                min={100}
+                max={2000000}
+                step={100}
+                value={count}
+                disabled={busy}
+                onChange={(e: { target: { value: any; }; }) => setCount(Number(e.target.value))}
+              />
+            </label>
+            <label>
+              Chunk size
+              <input
+                type="number"
+                min={10}
+                max={5000}
+                step={10}
+                value={chunkSize}
+                disabled={busy}
+                onChange={(e: { target: { value: any; }; }) => setChunkSize(Number(e.target.value))}
+              />
+            </label>
+            <label>
+              Delay / chunk (ms)
+              <input
+                type="number"
+                min={0}
+                max={1000}
+                step={5}
+                value={delayMs}
+                disabled={busy}
+                onChange={(e: { target: { value: any; }; }) => setDelayMs(Number(e.target.value))}
+              />
+            </label>
 
-        {busy ? (
-          <button className="btn stop" onClick={stop}>
-            Stop
-          </button>
-        ) : (
-          <button className="btn start" onClick={start}>
-            Start streaming
-          </button>
-        )}
+            {busy ? (
+              <button className="btn stop" onClick={stop}>
+                Stop
+              </button>
+            ) : (
+              <button className="btn start" onClick={start}>
+                Start streaming
+              </button>
+            )}
+          </div>
+        </details>
 
-        <input
-          ref={fileInputRef}
-          type="file"
-          accept=".json,application/json"
-          onChange={handleFileSelected}
-          style={{ display: "none" }}
-        />
-        <button
-          className="btn import"
-          disabled={busy}
-          onClick={() => fileInputRef.current?.click()}
-        >
-          Import from disk…
-        </button>
+        <details className="control-panel" open>
+          <summary>Import</summary>
+          <div className="controls">
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept=".json,application/json"
+              onChange={handleFileSelected}
+              style={{ display: "none" }}
+            />
+            <button
+              className="btn import"
+              disabled={busy}
+              onClick={() => fileInputRef.current?.click()}
+            >
+              Import from disk…
+            </button>
 
-        <div className="url-import-group">
-          <input
-            type="text"
-            className="url-input"
-            placeholder="https://example.com/data.json"
-            value={importUrl}
-            disabled={busy}
-            onChange={(e: { target: { value: any; }; }) => setImportUrl(e.target.value)}
-          />
-          <button
-            className="btn url-import"
-            disabled={busy || !importUrl.trim()}
-            onClick={handleImportUrl}
-          >
-            Import from URL
-          </button>
-        </div>
+            <div className="url-import-group">
+              <input
+                type="text"
+                className="url-input"
+                placeholder="https://example.com/data.json"
+                value={importUrl}
+                disabled={busy}
+                onChange={(e: { target: { value: any; }; }) => setImportUrl(e.target.value)}
+              />
+              <button
+                className="btn url-import"
+                disabled={busy || !importUrl.trim()}
+                onClick={handleImportUrl}
+              >
+                Import from URL
+              </button>
+            </div>
+          </div>
+        </details>
       </section>
 
       <section className="stats">
